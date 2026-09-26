@@ -19,7 +19,7 @@ Use `/session` in interactive mode to see the current session file, session ID, 
 
 For the JSONL file format and SessionManager API, see [Session Format](session-format.md).
 
-An isolated, not-yet-integrated implementation experiment for archived checkpoints and external image blobs is documented in [Bounded Session Prototype](session-checkpoint-prototype.md).
+The isolated same-ID hot sidecar and lazy image implementation is described in [Hot Session Store](session-hot-store.md). The separate stopped-session file-replacement experiment is described in [Bounded Session Prototype](session-checkpoint-prototype.md). Neither is deployed to the installed Pi runtime.
 
 ## Session Commands
 

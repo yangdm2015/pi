@@ -588,15 +588,19 @@ export class AgentSession {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		const projection = this.sessionManager.buildSessionProjection();
+		// Independently of model token pressure, cap the growth of the active
+		// on-disk suffix. Never discard history: normal compaction must succeed.
+		const diskPressure = settings.enabled && this.sessionManager.getActiveDiskBytes() > 16 * 1024 * 1024;
 
 		if (
 			!model ||
 			model.contextWindow <= 0 ||
-			!shouldCompact(
-				estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
-				model.contextWindow,
-				settings,
-			)
+			(!diskPressure &&
+				!shouldCompact(
+					estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+					model.contextWindow,
+					settings,
+				))
 		) {
 			return { ...context, messages: projection.messages };
 		}
@@ -623,9 +627,13 @@ export class AgentSession {
 				},
 				signal,
 			);
+			const preparedContext = previous?.context ?? canonicalContext;
 			return {
 				...previous,
-				context: previous?.context ?? canonicalContext,
+				context: {
+					...preparedContext,
+					messages: this.sessionManager.hydrateContextForModel(preparedContext.messages),
+				},
 				model: previous?.model ?? this.agent.state.model,
 				thinkingLevel: previous?.thinkingLevel ?? this.agent.state.thinkingLevel,
 			};
@@ -2497,7 +2505,7 @@ export class AgentSession {
 			}
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			const newEntries = this.sessionManager.getEntries();
+			const newEntries = this.sessionManager.getActiveEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
 
@@ -2836,7 +2844,7 @@ export class AgentSession {
 			abortController.signal.throwIfAborted();
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			const newEntries = this.sessionManager.getEntries();
+			const newEntries = this.sessionManager.getActiveEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
 

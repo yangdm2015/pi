@@ -75,6 +75,26 @@ function createSession(options: {
 		},
 		sessionManager: {
 			getEntries: () => entries,
+			getUsageSnapshot: () => {
+				const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+				let latestCacheHitRate: number | undefined;
+				for (const entry of entries) {
+					const value = (
+						entry.type === "message" ? (entry.message as { usage?: AssistantUsage }).usage : entry.usage
+					) as AssistantUsage | undefined;
+					if (!value) continue;
+					totals.input += value.input;
+					totals.output += value.output;
+					totals.cacheRead += value.cacheRead;
+					totals.cacheWrite += value.cacheWrite;
+					totals.cost += value.cost.total;
+					if (entry.type === "message" && (entry.message as { role: string }).role === "assistant") {
+						const prompt = value.input + value.cacheRead + value.cacheWrite;
+						latestCacheHitRate = prompt ? (value.cacheRead / prompt) * 100 : undefined;
+					}
+				}
+				return { totals, latestCacheHitRate };
+			},
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},

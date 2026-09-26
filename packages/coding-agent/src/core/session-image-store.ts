@@ -1,3 +1,4 @@
+import { getImageDimensions } from "@earendil-works/pi-tui";
 import { createHash, randomUUID } from "crypto";
 import {
 	closeSync,
@@ -84,7 +85,14 @@ export function serializeWithImageRefs(entry: object, sessionFile: string): stri
 		imageBlocks(original, (b) => oldLists.push(b));
 		imageBlocks(clone, (b) => newLists.push(b));
 		const index = oldLists.indexOf(block);
-		(newLists[index] as JsonObject).data = `${PREFIX}${hash}`;
+		const stored = newLists[index] as JsonObject;
+		stored.data = `${PREFIX}${hash}`;
+		stored.byteLength = bytes.length;
+		const dimensions = typeof block.mimeType === "string" ? getImageDimensions(data, block.mimeType) : null;
+		if (dimensions) {
+			stored.width = dimensions.widthPx;
+			stored.height = dimensions.heightPx;
+		}
 	});
 	return JSON.stringify(clone ?? entry);
 }
@@ -105,7 +113,12 @@ export function hydrateImageRefs<T extends object>(entry: T, sessionFile: string
 		const bytes = readFileSync(file);
 		if (createHash("sha256").update(bytes).digest("hex") !== match[1])
 			throw new Error(`Corrupt session image: ${file}`);
+		if (typeof block.byteLength === "number" && block.byteLength !== bytes.length)
+			throw new Error(`Incorrect session image size: ${file}`);
 		block.data = bytes.toString("base64");
+		delete block.byteLength;
+		delete block.width;
+		delete block.height;
 	});
 	return entry;
 }
