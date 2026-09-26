@@ -149,7 +149,11 @@ export function createCheckpointSession(
  * already stopped the CLI and its transcript watcher. The archive is linked
  * first; replacing the JSONL itself is a single same-filesystem rename.
  * There is deliberately no automatic live-session trigger here. */
-export function replaceStoppedSessionWithCheckpoint(sourcePath: string): {
+export function replaceStoppedSessionWithCheckpoint(
+	sourcePath: string,
+	/** Fault injection for isolated crash/rollback tests; not a lifecycle gate. */
+	testHooks?: { beforeReplace?: () => void; afterReplace?: () => void },
+): {
 	path: string;
 	archivePath: string;
 	entries: number;
@@ -213,8 +217,10 @@ export function replaceStoppedSessionWithCheckpoint(sourcePath: string): {
 		if (unchanged.ino !== original.ino || unchanged.size !== original.size || unchanged.mtimeMs !== original.mtimeMs)
 			throw new Error("Source session changed; refuse to replace a live transcript");
 		linkSync(source, archivePath);
+		testHooks?.beforeReplace?.();
 		// The original file remains available right up to this atomic rename.
 		renameSync(staged.path, source);
+		testHooks?.afterReplace?.();
 		rmSync(stageDir, { recursive: true, force: true });
 		return { path: source, archivePath, entries: staged.entries };
 	} catch (error) {

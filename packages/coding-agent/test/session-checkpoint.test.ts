@@ -1,6 +1,6 @@
 import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createCheckpointSession,
@@ -111,6 +111,47 @@ describe("offline session checkpoint", () => {
 		expect(SessionManager.open(source).buildSessionContext()).toEqual(context);
 		expect(readdirSync(`${result.archivePath}.images`)).toHaveLength(2);
 		expect(readdirSync(`${source}.images`)).toHaveLength(2);
+	});
+
+	it("leaves original bytes in place if the process fails before the atomic rename", () => {
+		const { manager } = setup();
+		manager.appendMessage({ role: "system", content: "system prompt", timestamp: Date.now() } as never);
+		manager.appendMessage(user("old"));
+		const keep = manager.appendMessage(assistant("keep"));
+		manager.appendCompaction("summary", keep, 100);
+		const source = manager.getSessionFile()!;
+		const before = readFileSync(source);
+		expect(() =>
+			replaceStoppedSessionWithCheckpoint(source, {
+				beforeReplace: () => {
+					throw new Error("simulated process interruption");
+				},
+			}),
+		).toThrow(/interruption/);
+		expect(readFileSync(source)).toEqual(before);
+		expect(readdirSync(join(manager.getSessionDir(), ".pi-archives"))).toHaveLength(0);
+	});
+
+	it("preserves a recoverable archive if failure follows the atomic rename", () => {
+		const { manager } = setup();
+		manager.appendMessage({ role: "system", content: "system prompt", timestamp: Date.now() } as never);
+		manager.appendMessage(user(`old-${"x".repeat(50_000)}`));
+		const keep = manager.appendMessage(assistant("keep"));
+		manager.appendCompaction("summary", keep, 100);
+		const source = manager.getSessionFile()!;
+		const before = readFileSync(source);
+		const expected = manager.buildSessionContext();
+		expect(() =>
+			replaceStoppedSessionWithCheckpoint(source, {
+				afterReplace: () => {
+					throw new Error("simulated post-rename interruption");
+				},
+			}),
+		).toThrow(/post-rename/);
+		const archiveRoot = join(manager.getSessionDir(), ".pi-archives");
+		const archive = join(archiveRoot, readdirSync(archiveRoot)[0]!, `${basename(source)}.archive`);
+		expect(readFileSync(archive)).toEqual(before);
+		expect(SessionManager.open(source).buildSessionContext()).toEqual(expected);
 	});
 
 	it("never replaces an uncheckpointable source", () => {
