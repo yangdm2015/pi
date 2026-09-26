@@ -1,6 +1,8 @@
+import { spawnSync } from "child_process";
 import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { basename, join } from "path";
+import { pathToFileURL } from "url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createCheckpointSession,
@@ -152,6 +154,42 @@ describe("offline session checkpoint", () => {
 		const archive = join(archiveRoot, readdirSync(archiveRoot)[0]!, `${basename(source)}.archive`);
 		expect(readFileSync(archive)).toEqual(before);
 		expect(SessionManager.open(source).buildSessionContext()).toEqual(expected);
+	});
+
+	it.each(["beforeReplace", "afterReplace"])("survives real SIGKILL at %s with archived images", (phase) => {
+		if (process.platform === "win32") return;
+		const { manager } = setup();
+		manager.appendMessage({ role: "system", content: "synthetic prompt", timestamp: Date.now() } as never);
+		const oldImage = Buffer.alloc(4096, 7).toString("base64");
+		const newImage = Buffer.alloc(4096, 9).toString("base64");
+		const image = (data: string) =>
+			({ role: "user", content: [{ type: "image", data, mimeType: "image/png" }], timestamp: Date.now() }) as never;
+		manager.appendMessage(image(oldImage));
+		manager.appendMessage(assistant("old"));
+		const keep = manager.appendMessage(image(newImage));
+		manager.appendMessage(assistant("new"));
+		manager.appendCompaction("picture history summarized", keep, 100);
+		const source = manager.getSessionFile()!;
+		const before = readFileSync(source);
+		const context = manager.buildSessionContext();
+		const moduleUri = pathToFileURL(join(import.meta.dirname, "../src/core/session-checkpoint.ts")).href;
+		const script =
+			`import {replaceStoppedSessionWithCheckpoint} from ${JSON.stringify(moduleUri)};` +
+			`replaceStoppedSessionWithCheckpoint(${JSON.stringify(source)},` +
+			`{${phase}:()=>process.kill(process.pid,"SIGKILL")});`;
+		const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], {
+			env: {},
+			stdio: "ignore",
+			timeout: 10_000,
+		});
+		expect(child.signal).toBe("SIGKILL");
+		const archiveRoot = join(manager.getSessionDir(), ".pi-archives");
+		const archive = join(archiveRoot, readdirSync(archiveRoot)[0]!, `${basename(source)}.archive`);
+		expect(readFileSync(archive)).toEqual(before);
+		expect(SessionManager.open(archive).getEntries()).toEqual(manager.getEntries());
+		if (phase === "beforeReplace") expect(readFileSync(source)).toEqual(before);
+		else expect(statSync(source).size).toBeLessThan(before.byteLength);
+		expect(SessionManager.open(source).buildSessionContext()).toEqual(context);
 	});
 
 	it("never replaces an uncheckpointable source", () => {
