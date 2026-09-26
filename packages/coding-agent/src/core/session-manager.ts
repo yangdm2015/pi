@@ -38,6 +38,9 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { loadHotSession, saveHotSession } from "./session-hot-store.ts";
+import { hydrateImageRefs, serializeWithImageRefs } from "./session-image-store.ts";
+import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./usage-totals.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -613,14 +616,16 @@ class SessionHeaderScanLimitError extends Error {
 	}
 }
 
-function parseSessionEntryLine(line: string): FileEntry | null {
+function parseSessionEntryLine(line: string, sessionFile?: string): FileEntry | null {
 	if (!line.trim()) return null;
+	let entry: FileEntry;
 	try {
-		return JSON.parse(line) as FileEntry;
+		entry = JSON.parse(line) as FileEntry;
 	} catch {
-		// Skip malformed lines
+		// Skip malformed lines, but never silently drop a broken image reference.
 		return null;
 	}
+	return sessionFile ? hydrateImageRefs(entry, sessionFile) : entry;
 }
 
 /** Exported for testing */
@@ -643,7 +648,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
+				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex), resolvedFilePath);
 				if (entry) entries.push(entry);
 				lineStart = newlineIndex + 1;
 				newlineIndex = pending.indexOf("\n", lineStart);
@@ -652,7 +657,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		}
 
 		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
+		const finalEntry = parseSessionEntryLine(pending, resolvedFilePath);
 		if (finalEntry) entries.push(finalEntry);
 	} finally {
 		closeSync(fd);
@@ -996,6 +1001,17 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private loadedFromHot = false;
+	private coldCompactionCount = 0;
+	private coldUsageTotals: UsageTotals = createUsageTotals();
+	private hotOffset: number | undefined;
+	/** Bytes in the current active disk generation, independent of model tokens. */
+	getActiveDiskBytes(): number {
+		if (!this.sessionFile) return 0;
+		const size = statSync(this.sessionFile).size;
+		const sidecar = this.hotOffset === undefined ? 0 : statSync(`${this.sessionFile}.hot`).size;
+		return size - (this.hotOffset ?? 0) + sidecar;
+	}
 
 	private constructor(
 		cwd: string,
@@ -1029,7 +1045,12 @@ export class SessionManager {
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+			const hot = preloadedFileEntries ? null : loadHotSession(this.sessionFile);
+			const entries = preloadedFileEntries ?? hot?.entries ?? loadEntriesFromFile(this.sessionFile);
+			this.loadedFromHot = hot !== null;
+			this.coldCompactionCount = hot?.coldCompactionCount ?? 0;
+			this.coldUsageTotals = hot?.coldUsageTotals ?? createUsageTotals();
+			this.hotOffset = hot?.offset;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1047,6 +1068,7 @@ export class SessionManager {
 
 			this._loadEntries(entries);
 			this.flushed = true;
+			if (!this.loadedFromHot) this._maybeSaveHotSession();
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -1074,6 +1096,10 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.flushed = false;
+		this.loadedFromHot = false;
+		this.coldCompactionCount = 0;
+		this.coldUsageTotals = createUsageTotals();
+		this.hotOffset = undefined;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1121,12 +1147,116 @@ export class SessionManager {
 		}
 	}
 
+	/** History-facing APIs may materialize the archival JSONL once. Ordinary
+	 * model-context reconstruction stays on the compact active branch. */
+	private _materializeFullHistory(): void {
+		if (!this.loadedFromHot || !this.sessionFile) return;
+		const leaf = this.leafId;
+		const entries = loadEntriesFromFile(this.sessionFile);
+		if (!entries.length || entries[0]?.type !== "session") throw new Error("Archived session is unavailable");
+		this.fileEntries = entries;
+		this.loadedFromHot = false;
+		this.coldCompactionCount = 0;
+		this.coldUsageTotals = createUsageTotals();
+		this._buildIndex();
+		if (leaf && this.byId.has(leaf)) this.leafId = leaf;
+	}
+
+	private static _usageForEntry(entry: SessionEntry): Usage | undefined {
+		if (entry.type === "usage") return entry.usage;
+		if (entry.type === "message" && (entry.message.role === "assistant" || entry.message.role === "toolResult"))
+			return entry.message.usage;
+		if (entry.type === "compaction" || entry.type === "branch_summary") return entry.usage;
+		return undefined;
+	}
+
+	/** Complete accounting without loading cold message bodies every frame. */
+	getUsageSnapshot(): { totals: UsageTotals; latestCacheHitRate?: number } {
+		const totals = { ...this.coldUsageTotals };
+		let latestCacheHitRate: number | undefined;
+		for (const entry of this.fileEntries) {
+			if (entry.type === "session") continue;
+			const usage = SessionManager._usageForEntry(entry);
+			if (usage) addUsageToTotals(totals, usage);
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const prompt = entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
+				latestCacheHitRate = prompt > 0 ? (entry.message.usage.cacheRead / prompt) * 100 : undefined;
+			}
+		}
+		return { totals, latestCacheHitRate };
+	}
+
+	getCompactionCount(): number {
+		return this.coldCompactionCount + this.fileEntries.filter((e) => e.type === "compaction").length;
+	}
+
+	private _maybeSaveHotSession(): void {
+		if (!this.persist || !this.sessionFile || !this.flushed) return;
+		let size: number;
+		try {
+			size = statSync(this.sessionFile).size;
+		} catch {
+			return;
+		}
+		if (size <= 10 * 1024 * 1024) return;
+		const entries = this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		const selected = buildContextEntries(entries, this.leafId, this.byId);
+		const compaction = selected[0] as CompactionEntry | undefined;
+		if (compaction?.type !== "compaction" || !compaction.systemMessage) return;
+		const state = buildSessionContext(entries, this.leafId, this.byId);
+		const timestamp = new Date().toISOString();
+		const contextEntries: SessionEntry[] = [];
+		if (state.model)
+			contextEntries.push({ type: "model_change", id: randomUUID(), parentId: null, timestamp, ...state.model });
+		if (state.thinkingLevel !== "off")
+			contextEntries.push({
+				type: "thinking_level_change",
+				id: randomUUID(),
+				parentId: null,
+				timestamp,
+				thinkingLevel: state.thinkingLevel,
+			});
+		const title = entries
+			.slice()
+			.reverse()
+			.find((e) => e.type === "session_info") as SessionInfoEntry | undefined;
+		if (title) contextEntries.push({ ...title, id: randomUUID(), parentId: null, timestamp });
+		// Preserve the real branch order: kept entries precede the compaction,
+		// which is the parent of subsequently appended turns. Placing retained
+		// messages after it would lose them as soon as a new turn is appended.
+		const path = this.getBranch();
+		const compactionIndex = path.findIndex((e) => e.id === compaction.id);
+		if (compactionIndex < 0) return;
+		const positions = new Map(path.map((e, i) => [e.id, i]));
+		const kept = selected.slice(1).filter((e) => (positions.get(e.id) ?? -1) < compactionIndex);
+		const suffix = selected.slice(1).filter((e) => (positions.get(e.id) ?? -1) > compactionIndex);
+		if (kept.length + suffix.length !== selected.length - 1) return;
+		const compacted = structuredClone([...contextEntries, ...kept, compaction, ...suffix]) as SessionEntry[];
+		for (let i = 0; i < compacted.length; i++) compacted[i]!.parentId = i ? compacted[i - 1]!.id : null;
+		const header = this.getHeader();
+		if (!header) return;
+		const hotIds = new Set(compacted.map((e) => e.id));
+		const coldUsageTotals = { ...this.coldUsageTotals };
+		let coldCompactionCount = this.coldCompactionCount;
+		for (const entry of entries) {
+			if (hotIds.has(entry.id)) continue;
+			if (entry.type === "compaction") coldCompactionCount++;
+			const usage = SessionManager._usageForEntry(entry);
+			if (usage) addUsageToTotals(coldUsageTotals, usage);
+		}
+		// Auxiliary snapshot only: the authoritative JSONL and watcher offset do
+		// not change, so BotMux keeps the same logical/native session binding.
+		if (saveHotSession(this.sessionFile, [header, ...compacted], coldCompactionCount, coldUsageTotals))
+			this.hotOffset = statSync(this.sessionFile).size;
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
+		this._materializeFullHistory();
 		const fd = openSync(this.sessionFile, "w");
 		try {
 			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				writeFileSync(fd, `${serializeWithImageRefs(entry, this.sessionFile)}\n`);
 			}
 		} finally {
 			closeSync(fd);
@@ -1177,14 +1307,14 @@ export class SessionManager {
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+					writeFileSync(fd, `${serializeWithImageRefs(e, this.sessionFile)}\n`);
 				}
 			} finally {
 				closeSync(fd);
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			appendFileSync(this.sessionFile, `${serializeWithImageRefs(entry, this.sessionFile)}\n`);
 		}
 	}
 
@@ -1193,6 +1323,7 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+		if (entry.type === "compaction") this._maybeSaveHotSession();
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1318,7 +1449,7 @@ export class SessionManager {
 	getSessionName(): string | undefined {
 		// Walk entries in reverse to find the latest session_info entry.
 		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
+		const entries = this.fileEntries;
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
 			if (entry.type === "session_info") {
@@ -1410,6 +1541,7 @@ export class SessionManager {
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
+		if (!this.byId.has(id)) this._materializeFullHistory();
 		return this.byId.get(id);
 	}
 
@@ -1417,6 +1549,7 @@ export class SessionManager {
 	 * Get all direct children of an entry.
 	 */
 	getChildren(parentId: string): SessionEntry[] {
+		this._materializeFullHistory();
 		const children: SessionEntry[] = [];
 		for (const entry of this.byId.values()) {
 			if (entry.parentId === parentId) {
@@ -1469,6 +1602,7 @@ export class SessionManager {
 	getBranch(fromId?: string): SessionEntry[] {
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
+		if (fromId && !this.byId.has(fromId)) this._materializeFullHistory();
 		let current = startId ? this.byId.get(startId) : undefined;
 		while (current) {
 			path.push(current);
@@ -1483,7 +1617,32 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+		const entries = buildContextEntries(this.getActiveEntries(), this.leafId, this.byId);
+		// Rendering the visible entries is an explicit view boundary. Keep the
+		// storage and agent-state entries as references until that point.
+		return this.sessionFile ? entries.map((e) => this._hydrateViewedEntry(e)) : entries;
+	}
+
+	private _hydrateViewedEntry(entry: SessionEntry): SessionEntry {
+		if (!this.sessionFile || !JSON.stringify(entry).includes("pi-blob://sha256/")) return entry;
+		return hydrateImageRefs(structuredClone(entry), this.sessionFile);
+	}
+
+	/** Restore binary image data only for messages about to be sent to a model. */
+	hydrateContextForModel(messages: SessionContext["messages"]): SessionContext["messages"] {
+		if (!this.sessionFile) return messages;
+		return messages.map((message) => {
+			const content = "content" in message ? message.content : null;
+			if (
+				!Array.isArray(content) ||
+				!content.some(
+					(block: { type: string; data?: string }) =>
+						block.type === "image" && block.data?.startsWith("pi-blob://sha256/"),
+				)
+			)
+				return message;
+			return hydrateImageRefs({ type: "message", message: structuredClone(message) }, this.sessionFile!).message;
+		});
 	}
 
 	/**
@@ -1491,12 +1650,16 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		return buildSessionProjection(this.getEntries(), this.leafId, this.byId);
+		return buildSessionProjection(
+			this.fileEntries.filter((e): e is SessionEntry => e.type !== "session"),
+			this.leafId,
+			this.byId,
+		);
 	}
 
 	buildSessionContext(): SessionContext {
 		const { messages, thinkingLevel, model } = this.buildSessionProjection();
-		return { messages, thinkingLevel, model };
+		return { messages: this.hydrateContextForModel(messages), thinkingLevel, model };
 	}
 
 	/**
@@ -1512,8 +1675,60 @@ export class SessionManager {
 	 * The session is append-only: use appendXXX() to add entries, branch() to
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
-	getEntries(): SessionEntry[] {
+	/** Read at most one page of the authoritative append-only history. The
+	 * returned cursor is a byte offset after a complete JSONL line; callers
+	 * must pass it back unchanged. No other archived bodies are parsed. */
+	getArchivedEntriesPage(cursor = 0, limit = 50): { entries: SessionEntry[]; nextCursor: number | null } {
+		if (!this.sessionFile) return { entries: [], nextCursor: null };
+		if (!Number.isSafeInteger(cursor) || cursor < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200)
+			throw new Error("Invalid history page cursor or limit");
+		const fd = openSync(this.sessionFile, "r");
+		const entries: SessionEntry[] = [];
+		let position = cursor;
+		let pieces: Buffer[] = [];
+		try {
+			const length = statSync(this.sessionFile).size;
+			if (position > length) throw new Error("History cursor exceeds session size");
+			if (position > 0) {
+				const prior = Buffer.alloc(1);
+				if (readSync(fd, prior, 0, 1, position - 1) !== 1 || prior[0] !== 10)
+					throw new Error("History cursor must be at a line boundary");
+			}
+			const buffer = Buffer.allocUnsafe(64 * 1024);
+			while (position < length && entries.length < limit) {
+				const count = readSync(fd, buffer, 0, Math.min(buffer.length, length - position), position);
+				if (count === 0) break;
+				let start = 0;
+				for (let i = 0; i < count; i++) {
+					if (buffer[i] !== 10) continue;
+					pieces.push(Buffer.from(buffer.subarray(start, i)));
+					const line = Buffer.concat(pieces).toString("utf8");
+					pieces = [];
+					position += i - start + 1;
+					start = i + 1;
+					const entry = parseSessionEntryLine(line, this.sessionFile);
+					if (entry?.type !== "session" && entry) entries.push(entry);
+					if (entries.length === limit) break;
+				}
+				if (entries.length === limit) break;
+				if (start < count) pieces.push(Buffer.from(buffer.subarray(start, count)));
+				position += count - start;
+			}
+			if (pieces.length > 0) throw new Error("Incomplete archived history line");
+			return { entries, nextCursor: position < length ? position : null };
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	/** Active checkpoint and suffix, without pulling cold history into memory. */
+	getActiveEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+	}
+
+	getEntries(): SessionEntry[] {
+		this._materializeFullHistory();
+		return this.getActiveEntries();
 	}
 
 	/**
@@ -1572,10 +1787,12 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		if (!this.byId.has(branchFromId)) this._materializeFullHistory();
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.hotOffset = undefined;
 	}
 
 	/**
@@ -1584,7 +1801,9 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this._materializeFullHistory();
 		this.leafId = null;
+		this.hotOffset = undefined;
 	}
 
 	/**
