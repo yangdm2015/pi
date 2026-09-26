@@ -2,7 +2,11 @@ import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSyn
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createCheckpointSession, createCheckpointSessionIfLarge } from "../src/core/session-checkpoint.ts";
+import {
+	createCheckpointSession,
+	createCheckpointSessionIfLarge,
+	replaceStoppedSessionWithCheckpoint,
+} from "../src/core/session-checkpoint.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
 const dirs: string[] = [];
@@ -29,7 +33,7 @@ describe("offline session checkpoint", () => {
 	it("keeps the source unchanged while restoring exactly the current model messages", () => {
 		const { dir, manager } = setup();
 		manager.appendMessage({ role: "system", content: "system prompt", timestamp: Date.now() } as never);
-		manager.appendMessage(user("archived-" + "x".repeat(300_000)));
+		manager.appendMessage(user(`archived-${"x".repeat(300_000)}`));
 		manager.appendMessage(assistant("old answer"));
 		const retainedId = manager.appendMessage(user("kept prompt"));
 		manager.appendMessage(assistant("kept answer"));
@@ -70,6 +74,49 @@ describe("offline session checkpoint", () => {
 		appendFileSync(source, "incomplete");
 		expect(() => createCheckpointSession(source, dir)).toThrow(/incomplete last line/);
 		expect(readFileSync(source, "utf8")).toMatch(/incomplete$/);
+	});
+
+	it("keeps the same native id and path while archiving old bytes and image blobs", () => {
+		const { manager } = setup();
+		manager.appendMessage({ role: "system", content: "system prompt", timestamp: Date.now() } as never);
+		const oldImage = Buffer.alloc(200_000, 1).toString("base64");
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "image", data: oldImage, mimeType: "image/png" }],
+			timestamp: Date.now(),
+		} as never);
+		manager.appendMessage(assistant("old image seen"));
+		const kept = manager.appendMessage(user(`kept-${"x".repeat(100_000)}`));
+		manager.appendMessage(assistant("kept answer"));
+		manager.appendCompaction("old picture summarized", kept, 9000);
+		const freshImage = Buffer.alloc(150_000, 2).toString("base64");
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "image", data: freshImage, mimeType: "image/png" }],
+			timestamp: Date.now(),
+		} as never);
+		const source = manager.getSessionFile()!;
+		const oldId = manager.getSessionId();
+		const oldBytes = readFileSync(source);
+		const context = manager.buildSessionContext();
+		const result = replaceStoppedSessionWithCheckpoint(source);
+		expect(result.path).toBe(source);
+		expect(readFileSync(result.archivePath)).toEqual(oldBytes);
+		expect(SessionManager.open(result.archivePath).getSessionId()).toBe(oldId);
+		expect(SessionManager.open(source).getSessionId()).toBe(oldId);
+		expect(SessionManager.open(source).buildSessionContext()).toEqual(context);
+		expect(readdirSync(`${result.archivePath}.images`)).toHaveLength(2);
+		expect(readdirSync(`${source}.images`)).toHaveLength(2);
+	});
+
+	it("never replaces an uncheckpointable source", () => {
+		const { manager } = setup();
+		manager.appendMessage(user("hello"));
+		manager.appendMessage(assistant("world"));
+		const source = manager.getSessionFile()!;
+		const before = readFileSync(source);
+		expect(() => replaceStoppedSessionWithCheckpoint(source)).toThrow(/compaction/);
+		expect(readFileSync(source)).toEqual(before);
 	});
 
 	it("retains model and thinking settings across a retain-none compaction", () => {

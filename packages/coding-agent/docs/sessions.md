@@ -19,6 +19,8 @@ Use `/session` in interactive mode to see the current session file, session ID, 
 
 For the JSONL file format and SessionManager API, see [Session Format](session-format.md).
 
+An isolated, not-yet-integrated implementation experiment for archived checkpoints and external image blobs is documented in [Bounded Session Prototype](session-checkpoint-prototype.md).
+
 ## Session Commands
 
 | Command | Description |

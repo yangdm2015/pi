@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync } from "fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -42,6 +42,14 @@ describe("session image store", () => {
 		expect(hydrateImageRefs(JSON.parse(json), file)).toEqual(source);
 	});
 
+	it("rejects a corrupted blob even when its filename already exists", () => {
+		const file = join(newDir(), "session.jsonl");
+		serializeWithImageRefs(entry(), file);
+		const blob = join(`${file}.images`, readdirSync(`${file}.images`)[0]!);
+		writeFileSync(blob, "corrupt");
+		expect(() => serializeWithImageRefs(entry(), file)).toThrow(/Corrupt/);
+	});
+
 	it("integrates with JSONL persistence and resume", () => {
 		const dir = newDir();
 		const manager = SessionManager.create(dir, dir);
@@ -59,6 +67,25 @@ describe("session image store", () => {
 		const reopened = SessionManager.open(file);
 		const user = reopened.getEntries().find((e) => e.type === "message" && e.message.role === "user");
 		expect(user && user.type === "message" && user.message.content).toEqual(entry().message.content);
+	});
+
+	it("re-refs images when a session is forked to another directory", () => {
+		const sourceDir = newDir();
+		const targetDir = newDir();
+		const manager = SessionManager.create(sourceDir, sourceDir);
+		manager.appendMessage({ role: "user", content: entry().message.content, timestamp: Date.now() } as never);
+		manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "ok" }],
+			timestamp: Date.now(),
+			provider: "test",
+			model: "test",
+			stopReason: "stop",
+		} as never);
+		const fork = SessionManager.forkFrom(manager.getSessionFile()!, targetDir, targetDir);
+		expect(readFileSync(fork.getSessionFile()!, "utf8")).not.toContain(image);
+		expect(readdirSync(`${fork.getSessionFile()!}.images`)).toHaveLength(1);
+		expect(fork.buildSessionContext()).toEqual(manager.buildSessionContext());
 	});
 
 	it("fails closed on a missing or symlinked image instead of silently losing context", () => {

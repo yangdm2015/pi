@@ -1,6 +1,22 @@
-import { randomUUID } from "crypto";
-import { closeSync, lstatSync, mkdirSync, openSync, readSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { join, resolve } from "path";
+import { createHash, randomUUID } from "crypto";
+import {
+	closeSync,
+	existsSync,
+	linkSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	renameSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "fs";
+import { basename, dirname, join, resolve } from "path";
 import { serializeWithImageRefs } from "./session-image-store.ts";
 import {
 	buildContextEntries,
@@ -38,8 +54,15 @@ export function createCheckpointSessionIfLarge(
  * Callers must retire the old session and independently bind the new session;
  * this function never switches a running CLI or a botmux transcript watcher.
  */
-export function createCheckpointSession(sourcePath: string, outputDir: string): CheckpointSessionResult {
+export function createCheckpointSession(
+	sourcePath: string,
+	outputDir: string,
+	options?: { preserveSessionId?: boolean; parentSession?: string },
+): CheckpointSessionResult {
 	const source = resolve(sourcePath);
+	if (options?.preserveSessionId && dirname(source) === resolve(outputDir)) {
+		throw new Error("Preserving a session id requires a private staging directory");
+	}
 	const before = lstatSync(source);
 	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Checkpoint source must be a regular file");
 	if (before.size === 0) throw new Error("Cannot checkpoint an empty session");
@@ -63,7 +86,7 @@ export function createCheckpointSession(sourcePath: string, outputDir: string): 
 	}
 	// Other branches and extension state may still refer to old entries. Keep
 	// their authoritative bytes in the old file rather than inventing a replay.
-	const id = randomUUID();
+	const id = options?.preserveSessionId ? (header as SessionHeader).id : randomUUID();
 	const timestamp = new Date().toISOString();
 	const newHeader: SessionHeader = {
 		type: "session",
@@ -71,7 +94,7 @@ export function createCheckpointSession(sourcePath: string, outputDir: string): 
 		id,
 		timestamp,
 		cwd: (header as SessionHeader).cwd,
-		parentSession: source,
+		parentSession: options?.parentSession ?? source,
 	};
 	const current = buildSessionContext(entries, leaf);
 	const state: SessionEntry[] = [];
@@ -120,4 +143,83 @@ export function createCheckpointSession(sourcePath: string, outputDir: string): 
 		throw new Error("Source session changed during checkpoint; discarded incomplete handoff");
 	}
 	return { path, id, entries: compacted.length };
+}
+
+/** Keep the botmux/Pi native ID and pathname stable, but only when the owner has
+ * already stopped the CLI and its transcript watcher. The archive is linked
+ * first; replacing the JSONL itself is a single same-filesystem rename.
+ * There is deliberately no automatic live-session trigger here. */
+export function replaceStoppedSessionWithCheckpoint(sourcePath: string): {
+	path: string;
+	archivePath: string;
+	entries: number;
+} {
+	const source = resolve(sourcePath);
+	const original = lstatSync(source);
+	if (!original.isFile() || original.isSymbolicLink()) throw new Error("Checkpoint source must be a regular file");
+	const root = join(dirname(source), ".pi-archives");
+	if (existsSync(root)) {
+		const stat = lstatSync(root);
+		if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
+			throw new Error(`Unsafe archive directory: ${root}`);
+	} else {
+		mkdirSync(root, { mode: 0o700 });
+	}
+	const archiveDir = mkdtempSync(join(root, "checkpoint-"));
+	const archivePath = join(archiveDir, basename(source));
+	const stageDir = join(archiveDir, "staging");
+	mkdirSync(stageDir, { mode: 0o700 });
+	try {
+		const staged = createCheckpointSession(source, stageDir, {
+			preserveSessionId: true,
+			parentSession: archivePath,
+		});
+		const archiveBlobs = `${archivePath}.images`;
+		const oldBlobs = `${source}.images`;
+		if (existsSync(oldBlobs)) {
+			const stat = lstatSync(oldBlobs);
+			if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
+				throw new Error(`Unsafe session image directory: ${oldBlobs}`);
+			mkdirSync(archiveBlobs, { mode: 0o700 });
+			for (const name of readdirSync(oldBlobs)) {
+				const file = join(oldBlobs, name);
+				const blob = lstatSync(file);
+				if (!/^[0-9a-f]{64}$/.test(name) || !blob.isFile() || blob.isSymbolicLink() || (blob.mode & 0o077) !== 0)
+					throw new Error(`Unsafe session image: ${file}`);
+				linkSync(file, join(archiveBlobs, name));
+			}
+		}
+		const newBlobs = `${staged.path}.images`;
+		if (existsSync(newBlobs)) {
+			if (!existsSync(oldBlobs)) mkdirSync(oldBlobs, { mode: 0o700 });
+			for (const name of readdirSync(newBlobs)) {
+				const target = join(oldBlobs, name);
+				if (existsSync(target)) {
+					const stat = lstatSync(target);
+					if (
+						!stat.isFile() ||
+						stat.isSymbolicLink() ||
+						createHash("sha256").update(readFileSync(target)).digest("hex") !== name
+					)
+						throw new Error(`Corrupt session image: ${target}`);
+				} else {
+					linkSync(join(newBlobs, name), target);
+				}
+			}
+		}
+		const unchanged = lstatSync(source);
+		if (unchanged.ino !== original.ino || unchanged.size !== original.size || unchanged.mtimeMs !== original.mtimeMs)
+			throw new Error("Source session changed; refuse to replace a live transcript");
+		linkSync(source, archivePath);
+		// The original file remains available right up to this atomic rename.
+		renameSync(staged.path, source);
+		rmSync(stageDir, { recursive: true, force: true });
+		return { path: source, archivePath, entries: staged.entries };
+	} catch (error) {
+		// Never remove an archive after replacement; callers can inspect and
+		// repair a failed post-rename cleanup without losing historical bytes.
+		if (existsSync(source) && lstatSync(source).ino === original.ino)
+			rmSync(archiveDir, { recursive: true, force: true });
+		throw error;
+	}
 }

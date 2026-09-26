@@ -1858,7 +1858,7 @@ export class SessionManager {
 		// Copy all non-header entries from source
 		for (const entry of sourceEntries) {
 			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+				appendFileSync(newSessionFile, `${serializeWithImageRefs(entry, newSessionFile)}\n`);
 			}
 		}
 
