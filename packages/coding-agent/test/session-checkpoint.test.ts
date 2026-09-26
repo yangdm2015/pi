@@ -77,7 +77,7 @@ describe("offline session checkpoint", () => {
 	});
 
 	it("keeps the same native id and path while archiving old bytes and image blobs", () => {
-		const { manager } = setup();
+		const { dir, manager } = setup();
 		manager.appendMessage({ role: "system", content: "system prompt", timestamp: Date.now() } as never);
 		const oldImage = Buffer.alloc(200_000, 1).toString("base64");
 		manager.appendMessage({
@@ -101,6 +101,10 @@ describe("offline session checkpoint", () => {
 		const context = manager.buildSessionContext();
 		const result = replaceStoppedSessionWithCheckpoint(source);
 		expect(result.path).toBe(source);
+		// Botmux discovers UUID-suffixed .jsonl recursively: archives must not
+		// also match that suffix, or the live transcript becomes ambiguous.
+		expect(result.archivePath).not.toMatch(/\.jsonl$/);
+		expect(SessionManager.findById(dir, oldId, dir)).toBe(source);
 		expect(readFileSync(result.archivePath)).toEqual(oldBytes);
 		expect(SessionManager.open(result.archivePath).getSessionId()).toBe(oldId);
 		expect(SessionManager.open(source).getSessionId()).toBe(oldId);

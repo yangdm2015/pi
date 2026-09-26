@@ -166,7 +166,9 @@ export function replaceStoppedSessionWithCheckpoint(sourcePath: string): {
 		mkdirSync(root, { mode: 0o700 });
 	}
 	const archiveDir = mkdtempSync(join(root, "checkpoint-"));
-	const archivePath = join(archiveDir, basename(source));
+	// Botmux recursively discovers UUID-suffixed .jsonl files. The archive
+	// must retain its readable bytes without matching that live-file suffix.
+	const archivePath = join(archiveDir, `${basename(source)}.archive`);
 	const stageDir = join(archiveDir, "staging");
 	mkdirSync(stageDir, { mode: 0o700 });
 	try {
