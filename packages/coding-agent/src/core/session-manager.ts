@@ -38,6 +38,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { hydrateImageRefs, serializeWithImageRefs } from "./session-image-store.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -613,14 +614,16 @@ class SessionHeaderScanLimitError extends Error {
 	}
 }
 
-function parseSessionEntryLine(line: string): FileEntry | null {
+function parseSessionEntryLine(line: string, sessionFile?: string): FileEntry | null {
 	if (!line.trim()) return null;
+	let entry: FileEntry;
 	try {
-		return JSON.parse(line) as FileEntry;
+		entry = JSON.parse(line) as FileEntry;
 	} catch {
-		// Skip malformed lines
+		// Skip malformed lines, but never silently drop a broken image reference.
 		return null;
 	}
+	return sessionFile ? hydrateImageRefs(entry, sessionFile) : entry;
 }
 
 /** Exported for testing */
@@ -643,7 +646,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
+				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex), resolvedFilePath);
 				if (entry) entries.push(entry);
 				lineStart = newlineIndex + 1;
 				newlineIndex = pending.indexOf("\n", lineStart);
@@ -652,7 +655,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		}
 
 		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
+		const finalEntry = parseSessionEntryLine(pending, resolvedFilePath);
 		if (finalEntry) entries.push(finalEntry);
 	} finally {
 		closeSync(fd);
@@ -1126,7 +1129,7 @@ export class SessionManager {
 		const fd = openSync(this.sessionFile, "w");
 		try {
 			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				writeFileSync(fd, `${serializeWithImageRefs(entry, this.sessionFile)}\n`);
 			}
 		} finally {
 			closeSync(fd);
@@ -1163,7 +1166,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				appendFileSync(this.sessionFile, `${serializeWithImageRefs(entry, this.sessionFile)}\n`);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1175,14 +1178,14 @@ export class SessionManager {
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+					writeFileSync(fd, `${serializeWithImageRefs(e, this.sessionFile)}\n`);
 				}
 			} finally {
 				closeSync(fd);
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			appendFileSync(this.sessionFile, `${serializeWithImageRefs(entry, this.sessionFile)}\n`);
 		}
 	}
 
