@@ -1,9 +1,9 @@
 import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { buildOffsetIndex, readOffsetIndex } from "../src/core/session-offset-index.js";
-import type { FileEntry } from "../src/core/session-manager.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildOffsetIndex, loadIndexedActiveSession, readOffsetIndex } from "../src/core/session-offset-index.js";
+import { SessionManager, buildSessionContext, type FileEntry } from "../src/core/session-manager.js";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -51,6 +51,45 @@ describe("session offset metadata index", () => {
     symlinkSync(copy, `${file}.idx`);
     expect(readOffsetIndex(file)).toBeNull();
   });
+  it("loads only the current compacted branch, not large abandoned bodies", () => {
+    const { dir } = fixture();
+    const manager = SessionManager.create(dir, dir);
+    const now = Date.now();
+    manager.appendMessage({ role: "system", content: "system prompt", timestamp: now } as never);
+    manager.appendModelChange("test", "model");
+    manager.appendMessage({ role: "user", content: `OLD-BODY-${"x".repeat(512 * 1024)}`, timestamp: now } as never);
+    manager.appendMessage({ role: "assistant", provider: "test", model: "model", content: [{ type: "text", text: "old" }], stopReason: "stop", timestamp: now,
+      usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 0, totalTokens: 15,
+        cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } } } as never);
+    const kept = manager.appendMessage({ role: "user", content: "kept", timestamp: now } as never);
+    const compaction = manager.appendCompaction("summary", kept, 100);
+    manager.appendMessage({ role: "user", content: `OTHER-BRANCH-${"y".repeat(512 * 1024)}`, timestamp: now } as never);
+    manager.appendLabelChange(kept, "bookmark");
+    manager.branch(compaction);
+    const active = manager.appendMessage({ role: "user", content: "selected", timestamp: now } as never);
+    const file = manager.getSessionFile()!;
+    const expected = manager.buildSessionContext();
+    expect(buildOffsetIndex(file, [manager.getHeader()!, ...manager.getEntries()])).toBe(true);
+    const parse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, ...args: unknown[]) => {
+      if (typeof text === "string" && (text.includes("OLD-BODY-") || text.includes("OTHER-BRANCH-"))) throw new Error("parsed unneeded body");
+      return parse(text, ...(args as [any]));
+    });
+    try {
+      const result = loadIndexedActiveSession(file, readOffsetIndex(file)!);
+      expect(result).not.toBeNull();
+      const loaded = result!.entries.filter(e => e.type !== "session");
+      expect(loaded.at(-1)?.id).toBe(active);
+      expect(loaded.some(e => e.type === "compaction" && e.id === compaction)).toBe(true);
+      expect(loaded.some(e => e.type === "message" && e.message.role === "user" && e.message.content === "kept")).toBe(true);
+      expect(loaded.some(e => e.type === "message" && e.message.role === "user" && e.message.content === "selected")).toBe(true);
+      expect(result!.coldCompactionCount).toBe(0);
+      expect(result!.coldUsageTotals.input).toBe(10);
+      expect(loaded.some(e => e.type === "label" && e.targetId === kept && e.label === "bookmark")).toBe(true);
+      expect(buildSessionContext(loaded)).toEqual(expected);
+    } finally { spy.mockRestore(); }
+  });
+
   it("rejects incomplete source lines and invalid indexes without editing the original", () => {
     const { file, entries } = fixture();
     const before = readFileSync(file);

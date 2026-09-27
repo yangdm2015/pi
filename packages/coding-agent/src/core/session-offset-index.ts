@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Usage } from "@earendil-works/pi-ai";
 import { closeSync, lstatSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import type { FileEntry, SessionEntry } from "./session-manager.ts";
+import type { FileEntry, SessionEntry, SessionHeader } from "./session-manager.ts";
+import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./usage-totals.ts";
 
 const CHUNK_BYTES = 64 * 1024;
 const ANCHOR_BYTES = 8192;
@@ -13,6 +14,7 @@ export interface OffsetRecord {
 	start: number;
 	end: number;
 	usage?: Usage;
+	role?: string;
 	model?: { provider: string; modelId: string };
 	thinkingLevel?: string;
 	firstKeptEntryId?: string;
@@ -29,6 +31,7 @@ export interface OffsetIndex {
 	offset: number;
 	anchor: string;
 	records: OffsetRecord[];
+	checksum?: string;
 }
 
 function readAt(file: string, offset: number, length: number): Buffer {
@@ -84,7 +87,11 @@ export function buildOffsetIndex(file: string, validatedEntries: FileEntry[]): b
 			const entry = value as SessionEntry;
 			const record: OffsetRecord = { id: entry.id, parentId: entry.parentId, type: entry.type, start: ends[i]!, end: ends[i + 1]! };
 			if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") record.usage = entry.usage;
-			if (entry.type === "message" && (entry.message.role === "assistant" || entry.message.role === "toolResult")) record.usage = entry.message.usage;
+			if (entry.type === "message") {
+				record.role = entry.message.role;
+				if (entry.message.role === "assistant" || entry.message.role === "toolResult") record.usage = entry.message.usage;
+				if (entry.message.role === "assistant") record.model = { provider: entry.message.provider, modelId: entry.message.model };
+			}
 			if (entry.type === "model_change") record.model = { provider: entry.provider, modelId: entry.modelId };
 			if (entry.type === "thinking_level_change") record.thinkingLevel = entry.thinkingLevel;
 			if (entry.type === "compaction") record.firstKeptEntryId = entry.firstKeptEntryId;
@@ -100,6 +107,7 @@ export function buildOffsetIndex(file: string, validatedEntries: FileEntry[]): b
 		const path = `${file}.idx`;
 		const temp = `${path}.${randomUUID()}.tmp`;
 		try {
+			index.checksum = createHash("sha256").update(JSON.stringify(index)).digest("hex");
 			writeFileSync(temp, JSON.stringify(index), { flag: "wx", mode: 0o600 });
 			const after = statSync(file);
 			if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs) return false;
@@ -121,6 +129,8 @@ export function readOffsetIndex(file: string): OffsetIndex | null {
 		if (!source.isFile() || source.isSymbolicLink() || !side.isFile() || side.isSymbolicLink() || (side.mode & 0o077) !== 0)
 			return null;
 		const index = JSON.parse(readFileSync(`${file}.idx`, "utf8")) as OffsetIndex;
+		const { checksum, ...payload } = index;
+		if (typeof checksum !== "string" || createHash("sha256").update(JSON.stringify(payload)).digest("hex") !== checksum) return null;
 		if (index.version !== 1 || typeof index.id !== "string" || !index.id || index.dev !== source.dev || index.ino !== source.ino ||
 			index.offset !== source.size || !Array.isArray(index.records) || !Number.isSafeInteger(index.offset) || index.offset < 1 ||
 			index.records.length > index.offset) return null;
@@ -141,6 +151,107 @@ export function readOffsetIndex(file: string): OffsetIndex | null {
 		}
 		if (end !== index.offset || sourceAnchor(file, index.offset) !== index.anchor) return null;
 		return index;
+	} catch {
+		return null;
+	}
+}
+
+/** Use the index for topology; JSON-parse original bodies only after selecting
+ * the active path and the entries retained by its newest compaction. */
+export function loadIndexedActiveSession(file: string, index: OffsetIndex): {
+	entries: FileEntry[];
+	coldUsageTotals: UsageTotals;
+	coldCompactionCount: number;
+} | null {
+	try {
+		const source = statSync(file);
+		if (source.dev !== index.dev || source.ino !== index.ino || source.size !== index.offset) return null;
+		const byId = new Map(index.records.map(record => [record.id, record]));
+		const reversePath: OffsetRecord[] = [];
+		const visited = new Set<string>();
+		let current = index.records.at(-1);
+		while (current) {
+			if (visited.has(current.id)) return null;
+			visited.add(current.id);
+			reversePath.push(current);
+			if (current.parentId && !byId.has(current.parentId)) return null;
+			current = current.parentId ? byId.get(current.parentId) : undefined;
+		}
+		const path = reversePath.reverse();
+		const compactIndex = path.findLastIndex(record => record.type === "compaction");
+		let selected: OffsetRecord[];
+		if (compactIndex < 0) {
+			selected = path;
+		} else {
+			const compact = path[compactIndex]!;
+			const first = compact.firstKeptEntryId === compact.id
+				? compactIndex
+				: path.findIndex(record => record.id === compact.firstKeptEntryId);
+			if (first < 0 || first > compactIndex) return null;
+			selected = [
+				...path.slice(first, compactIndex).filter(record => !(record.type === "message" && record.role === "system")),
+				...path.slice(compactIndex),
+			];
+		}
+		const headerEnd = index.records[0]?.start ?? index.offset;
+		if (headerEnd < 2 || headerEnd > CHUNK_BYTES) return null;
+		const header = JSON.parse(readAt(file, 0, headerEnd - 1).toString("utf8")) as SessionHeader;
+		if (header.type !== "session" || header.id !== index.id) return null;
+		const prefix: SessionEntry[] = [];
+		if (compactIndex >= 0) {
+			let model: OffsetRecord["model"];
+			let thinkingLevel: string | undefined;
+			for (const record of path.slice(0, compactIndex)) {
+				if (record.model) model = record.model;
+				if (record.thinkingLevel) thinkingLevel = record.thinkingLevel;
+			}
+			const timestamp = new Date().toISOString();
+			if (model) prefix.push({ type: "model_change", id: randomUUID(), parentId: null, timestamp, ...model });
+			if (thinkingLevel && thinkingLevel !== "off")
+				prefix.push({ type: "thinking_level_change", id: randomUUID(), parentId: null, timestamp, thinkingLevel });
+			const title = index.records.findLast(record => record.type === "session_info" && record.name !== undefined);
+			if (title) prefix.push({ type: "session_info", id: randomUUID(), parentId: null, timestamp, name: title.name });
+		}
+		const bodies = selected.map(record => {
+			const bytes = readAt(file, record.start, record.end - record.start);
+			if (bytes.at(-1) !== 10) throw new Error("Incomplete indexed entry");
+			const entry = JSON.parse(bytes.subarray(0, -1).toString("utf8")) as SessionEntry;
+			if (entry.id !== record.id || entry.parentId !== record.parentId || entry.type !== record.type)
+				throw new Error("Indexed entry mismatch");
+			return entry;
+		});
+		const activeIds = new Set(bodies.map(entry => entry.id));
+		const labels = new Map<string, OffsetRecord>();
+		for (const record of index.records) {
+			if (record.type === "label" && record.label && activeIds.has(record.label.targetId))
+				labels.set(record.label.targetId, record);
+		}
+		const syntheticLabels: SessionEntry[] = [];
+		for (const record of labels.values()) {
+			if (activeIds.has(record.id) || !record.label) continue;
+			syntheticLabels.push({ type: "label", id: randomUUID(), parentId: null,
+				timestamp: record.label.timestamp, targetId: record.label.targetId, label: record.label.value });
+		}
+		// Preserve the real last entry as the leaf; synthetic latest label state
+		// goes after earlier selected labels, before that leaf.
+		const active = bodies.length
+			? [...prefix, ...bodies.slice(0, -1), ...syntheticLabels, bodies.at(-1)!]
+			: [...prefix, ...syntheticLabels];
+		const coldUsageTotals = createUsageTotals();
+		let coldCompactionCount = 0;
+		for (const record of index.records) {
+			if (activeIds.has(record.id)) continue;
+			if (record.type === "compaction") coldCompactionCount++;
+			if (record.usage) addUsageToTotals(coldUsageTotals, record.usage);
+		}
+		// Like the legacy hot snapshot, the selected branch is a compact in-memory
+		// projection; the authoritative file and indexed parent pointers stay intact.
+		const compacted = structuredClone(active);
+		for (let i = 0; i < compacted.length; i++) compacted[i]!.parentId = i ? compacted[i - 1]!.id : null;
+		const after = statSync(file);
+		if (after.dev !== source.dev || after.ino !== source.ino || after.size !== source.size || sourceAnchor(file, index.offset) !== index.anchor)
+			return null;
+		return { entries: [header, ...compacted], coldUsageTotals, coldCompactionCount };
 	} catch {
 		return null;
 	}
