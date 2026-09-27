@@ -163,7 +163,7 @@ export class CacheWarmer {
 	private run?: ActiveRun;
 	private inactive: CacheWarmingStatus;
 	private readonly models: Pick<ModelRuntime, "streamSimple">;
-	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">;
+	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getActiveBranch">;
 	private readonly getMode: () => CacheWarmingMode;
 	/** Lets extensions override `event.action`; failures fall back to pi's decision. */
 	private readonly decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
@@ -172,7 +172,7 @@ export class CacheWarmer {
 
 	constructor(
 		models: Pick<ModelRuntime, "streamSimple">,
-		sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">,
+		sessionManager: Pick<SessionManager, "appendUsage" | "getActiveBranch">,
 		getMode: () => CacheWarmingMode,
 		decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction> = async (event) => event.action,
 	) {
@@ -377,7 +377,7 @@ export class CacheWarmer {
 
 	private evaluate(run: ActiveRun): CacheWarmingDecision {
 		const model = run.model;
-		const promptTokens = lastPromptTokens(this.sessionManager.getBranch());
+		const promptTokens = lastPromptTokens(this.sessionManager.getActiveBranch());
 		const cacheHitCost = price(model, { cacheRead: promptTokens });
 		const cacheMissCost = price(
 			model,

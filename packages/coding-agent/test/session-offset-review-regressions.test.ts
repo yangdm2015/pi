@@ -91,19 +91,36 @@ it("never selects an in-memory synthetic ID as a persisted compaction boundary",
 	manager.appendMessage(message("C ".repeat(300)));
 	const recovered = indexed(manager);
 	const synthetic = recovered
-		.getBranch()
+		.getActiveBranch()
 		.filter((e) => (e as typeof e & { __offsetSynthetic?: boolean }).__offsetSynthetic)
 		.map((e) => e.id);
 	expect(synthetic.length).toBeGreaterThan(0);
 	let preparedCount = 0;
 	for (const keepRecentTokens of [1, 10, 100, 400]) {
-		const prepared = prepareCompaction(recovered.getBranch(), { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens });
+		const prepared = prepareCompaction(recovered.getActiveBranch(), {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens,
+		});
 		if (prepared) {
 			preparedCount++;
 			expect(synthetic).not.toContain(prepared.firstKeptEntryId);
 		}
 	}
 	expect(preparedCount).toBeGreaterThan(0);
+});
+
+it("keeps explicit extension branch inspection able to restore pre-compaction custom state", () => {
+	const manager = session();
+	manager.appendMessage(message("root"));
+	const state = manager.appendCustomEntry("todo-state", { list: ["persisted"] });
+	const kept = manager.appendMessage(message("kept"));
+	manager.appendCompaction("summary", kept, 100);
+	const recovered = indexed(manager);
+	expect(recovered.getActiveBranch().some((e) => e.id === state)).toBe(false);
+	expect(recovered.getBranch().find((e) => e.id === state)).toMatchObject({
+		type: "custom",
+		data: { list: ["persisted"] },
+	});
 });
 
 it("does not full-load old bodies to fetch a newly appended entry", () => {
@@ -135,9 +152,9 @@ it("preserves explicit thinking off and a cleared global title", () => {
 	manager.appendSessionInfo("");
 	const recovered = indexed(manager);
 	expect(recovered.getSessionName()).toBeUndefined();
-	expect(recovered.getBranch().some((e) => e.type === "thinking_level_change" && e.thinkingLevel === "off")).toBe(
-		true,
-	);
+	expect(
+		recovered.getActiveBranch().some((e) => e.type === "thinking_level_change" && e.thinkingLevel === "off"),
+	).toBe(true);
 });
 
 it("preserves a globally latest session title on an uncompacted abandoned branch", () => {

@@ -1259,7 +1259,7 @@ export class SessionManager {
 		// Preserve the real branch order: kept entries precede the compaction,
 		// which is the parent of subsequently appended turns. Placing retained
 		// messages after it would lose them as soon as a new turn is appended.
-		const path = this.getBranch();
+		const path = this.getActiveBranch();
 		const compactionIndex = path.findIndex((e) => e.id === compaction.id);
 		if (compactionIndex < 0) return;
 		const positions = new Map(path.map((e, i) => [e.id, i]));
@@ -1559,7 +1559,7 @@ export class SessionManager {
 		}
 		const target = this.byId.get(targetId);
 		if (!target) throw new Error(`Entry ${targetId} not found`);
-		if (!this.getBranch().some((entry) => entry.id === targetId)) {
+		if (!this.getActiveBranch().some((entry) => entry.id === targetId)) {
 			throw new Error(`Entry ${targetId} is not on the active branch`);
 		}
 		const editable =
@@ -1667,8 +1667,18 @@ export class SessionManager {
 	 * Includes all entry types (messages, compaction, model changes, etc.).
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
+	/** Explicit historical API: callers inspecting a branch receive original entries. */
 	getBranch(fromId?: string): SessionEntry[] {
-		if (fromId) this._materializeFullHistory();
+		this._materializeFullHistory();
+		return this._walkBranch(fromId);
+	}
+
+	/** Internal model/UI path without hydrating archived source entries. */
+	getActiveBranch(): SessionEntry[] {
+		return this._walkBranch();
+	}
+
+	private _walkBranch(fromId?: string): SessionEntry[] {
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;

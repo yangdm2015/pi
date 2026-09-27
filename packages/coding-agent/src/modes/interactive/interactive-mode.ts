@@ -3335,7 +3335,7 @@ export class InteractiveMode {
 					const entries = this.sessionManager.buildContextEntries();
 					if (entries[0]?.id !== event.entry.id) break;
 					this.chatContainer.clear();
-					const branch = this.sessionManager.getBranch();
+					const branch = this.sessionManager.getActiveBranch();
 					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
 					const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
 					const retainedEntries = entries.slice(1);
@@ -4005,7 +4005,7 @@ export class InteractiveMode {
 		let previousDroppedCount = 0;
 		// message_end reaches the UI before the current message is persisted,
 		// so the branch's last assistant message is the previous response.
-		const branch = this.sessionManager.getBranch();
+		const branch = this.sessionManager.getActiveBranch();
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const entry = branch[i];
 			if (entry.type === "message" && entry.message.role === "assistant") {

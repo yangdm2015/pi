@@ -104,7 +104,7 @@ function fakeRuntime(
 				} as unknown as AssistantMessageEventStream;
 			},
 		},
-		{ appendUsage, getBranch: () => state.branch },
+		{ appendUsage, getActiveBranch: () => state.branch },
 		() => state.mode,
 		async (event) => {
 			events.push(event);

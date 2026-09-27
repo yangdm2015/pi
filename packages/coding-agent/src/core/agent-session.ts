@@ -600,7 +600,7 @@ export class AgentSession {
 			model.contextWindow <= 0 ||
 			(!diskPressure &&
 				!shouldCompact(
-					estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+					estimateProjectedContextTokens(projection, this.sessionManager.getActiveBranch()).tokens,
 					model.contextWindow,
 					settings,
 				))
@@ -768,7 +768,7 @@ export class AgentSession {
 				case "compaction": {
 					const tokensBefore = estimateProjectedContextTokens(
 						manager.buildSessionProjection(),
-						manager.getBranch(),
+						manager.getActiveBranch(),
 					).tokens;
 					entryId = manager.appendCompaction(
 						draft.summary,
@@ -790,7 +790,7 @@ export class AgentSession {
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
-		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
+		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getActiveBranch()]);
 		this._applyBoundaryDrafts(manager, drafts);
 		return manager;
 	}
@@ -1003,7 +1003,7 @@ export class AgentSession {
 	private _findPersistedMessageEntryId(message: AgentMessage): string | undefined {
 		const mapped = this._entryIdsByMessage.get(message);
 		if (mapped) return mapped;
-		for (const entry of [...this.sessionManager.getBranch()].reverse()) {
+		for (const entry of [...this.sessionManager.getActiveBranch()].reverse()) {
 			if (entry.type === "message" && entry.message === message) return entry.id;
 		}
 
@@ -2432,7 +2432,7 @@ export class AgentSession {
 				env,
 			} = await this._getSummarizationRequestAuth(model, this._compactionAbortController.signal);
 
-			const pathEntries = this.sessionManager.getBranch();
+			const pathEntries = this.sessionManager.getActiveBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -2627,7 +2627,7 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getActiveBranch());
 		const assistantIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
 		if (assistantIsFromBeforeCompaction) {
@@ -2646,7 +2646,7 @@ export class AgentSession {
 					entry.sourceEntry.id === assistantEntryId &&
 					entry.messages.some((message) => message.role === "assistant"),
 			);
-		const branch = this.sessionManager.getBranch();
+		const branch = this.sessionManager.getActiveBranch();
 		const assistantIndex = assistantEntryId ? branch.findIndex((entry) => entry.id === assistantEntryId) : -1;
 		const entriesAfterAssistant = assistantIndex >= 0 ? branch.slice(assistantIndex + 1) : [];
 		const hasPostAssistantContextEdit = entriesAfterAssistant.some((entry) => entry.type === "context_edit");
@@ -2765,7 +2765,7 @@ export class AgentSession {
 				return false;
 			}
 
-			const pathEntries = this.sessionManager.getBranch();
+			const pathEntries = this.sessionManager.getActiveBranch();
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
 				return false;
@@ -3874,7 +3874,7 @@ export class AgentSession {
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
 		const projection = this.sessionManager.buildSessionProjection();
-		const branch = this.sessionManager.getBranch();
+		const branch = this.sessionManager.getActiveBranch();
 		const latestCompaction = getLatestCompactionEntry(branch);
 
 		if (latestCompaction) {
