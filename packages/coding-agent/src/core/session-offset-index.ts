@@ -122,7 +122,7 @@ export function buildOffsetIndex(file: string, validatedEntries: FileEntry[]): b
 }
 
 /** An untrusted or lagging index is not authority: the caller may full-load. */
-export function readOffsetIndex(file: string): OffsetIndex | null {
+export function readOffsetIndex(file: string, allowAppendedSource = false): OffsetIndex | null {
 	try {
 		const source = lstatSync(file);
 		const side = lstatSync(`${file}.idx`);
@@ -132,8 +132,8 @@ export function readOffsetIndex(file: string): OffsetIndex | null {
 		const { checksum, ...payload } = index;
 		if (typeof checksum !== "string" || createHash("sha256").update(JSON.stringify(payload)).digest("hex") !== checksum) return null;
 		if (index.version !== 1 || typeof index.id !== "string" || !index.id || index.dev !== source.dev || index.ino !== source.ino ||
-			index.offset !== source.size || !Array.isArray(index.records) || !Number.isSafeInteger(index.offset) || index.offset < 1 ||
-			index.records.length > index.offset) return null;
+			(allowAppendedSource ? index.offset > source.size : index.offset !== source.size) || !Array.isArray(index.records) ||
+			!Number.isSafeInteger(index.offset) || index.offset < 1 || index.records.length > index.offset) return null;
 		const first = readAt(file, 0, Math.min(source.size, CHUNK_BYTES));
 		const headerEnd = first.indexOf(10);
 		const header = headerEnd < 0 ? null : JSON.parse(first.subarray(0, headerEnd).toString("utf8")) as { id?: string; type?: string };
@@ -156,12 +156,56 @@ export function readOffsetIndex(file: string): OffsetIndex | null {
 	}
 }
 
+/** Keep the authoritative append first; publish the metadata update atomically.
+ * Rewriting metadata does not read or deserialize earlier JSONL bodies. */
+export function appendOffsetIndex(file: string, entry: SessionEntry): boolean {
+	const index = readOffsetIndex(file, true);
+	if (!index) return false;
+	const path = `${file}.idx`;
+	const temp = `${path}.${randomUUID()}.tmp`;
+	try {
+		const before = statSync(file);
+		const length = before.size - index.offset;
+		if (length < 2) return false;
+		const tail = readAt(file, index.offset, length);
+		if (tail.at(-1) !== 10 || tail.indexOf(10) !== length - 1 || index.records.some(record => record.id === entry.id)) return false;
+		const record: OffsetRecord = { id: entry.id, parentId: entry.parentId, type: entry.type, start: index.offset, end: before.size };
+		if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") record.usage = entry.usage;
+		if (entry.type === "message") {
+			record.role = entry.message.role;
+			if (entry.message.role === "assistant" || entry.message.role === "toolResult") record.usage = entry.message.usage;
+			if (entry.message.role === "assistant") record.model = { provider: entry.message.provider, modelId: entry.message.model };
+		}
+		if (entry.type === "model_change") record.model = { provider: entry.provider, modelId: entry.modelId };
+		if (entry.type === "thinking_level_change") record.thinkingLevel = entry.thinkingLevel;
+		if (entry.type === "compaction") record.firstKeptEntryId = entry.firstKeptEntryId;
+		if (entry.type === "label") record.label = { targetId: entry.targetId, value: entry.label, timestamp: entry.timestamp };
+		if (entry.type === "session_info") record.name = entry.name;
+		if (entry.type === "context_edit") record.targetId = entry.targetId;
+		index.records.push(record);
+		index.offset = before.size;
+		index.anchor = sourceAnchor(file, before.size);
+		delete index.checksum;
+		index.checksum = createHash("sha256").update(JSON.stringify(index)).digest("hex");
+		writeFileSync(temp, JSON.stringify(index), { flag: "wx", mode: 0o600 });
+		const after = statSync(file);
+		if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs) return false;
+		renameSync(temp, path);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		try { unlinkSync(temp); } catch { /* published or already removed */ }
+	}
+}
+
 /** Use the index for topology; JSON-parse original bodies only after selecting
  * the active path and the entries retained by its newest compaction. */
 export function loadIndexedActiveSession(file: string, index: OffsetIndex): {
 	entries: FileEntry[];
 	coldUsageTotals: UsageTotals;
 	coldCompactionCount: number;
+	activeBytes: number;
 } | null {
 	try {
 		const source = statSync(file);
@@ -251,7 +295,8 @@ export function loadIndexedActiveSession(file: string, index: OffsetIndex): {
 		const after = statSync(file);
 		if (after.dev !== source.dev || after.ino !== source.ino || after.size !== source.size || sourceAnchor(file, index.offset) !== index.anchor)
 			return null;
-		return { entries: [header, ...compacted], coldUsageTotals, coldCompactionCount };
+		return { entries: [header, ...compacted], coldUsageTotals, coldCompactionCount,
+			activeBytes: selected.reduce((sum, record) => sum + record.end - record.start, 0) };
 	} catch {
 		return null;
 	}

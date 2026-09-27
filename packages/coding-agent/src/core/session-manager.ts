@@ -23,6 +23,7 @@ import {
 	readSync,
 	type Stats,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -38,7 +39,8 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
-import { loadHotSession, saveHotSession } from "./session-hot-store.ts";
+import { saveHotSession } from "./session-hot-store.ts";
+import { appendOffsetIndex, buildOffsetIndex, loadIndexedActiveSession, readOffsetIndex } from "./session-offset-index.ts";
 import { hydrateImageRefs, serializeWithImageRefs } from "./session-image-store.ts";
 import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./usage-totals.ts";
 export const CURRENT_SESSION_VERSION = 3;
@@ -1005,9 +1007,11 @@ export class SessionManager {
 	private coldCompactionCount = 0;
 	private coldUsageTotals: UsageTotals = createUsageTotals();
 	private hotOffset: number | undefined;
+	private indexedActiveBytes: number | undefined;
 	/** Bytes in the current active disk generation, independent of model tokens. */
 	getActiveDiskBytes(): number {
 		if (!this.sessionFile) return 0;
+		if (this.indexedActiveBytes !== undefined) return this.indexedActiveBytes;
 		const size = statSync(this.sessionFile).size;
 		const sidecar = this.hotOffset === undefined ? 0 : statSync(`${this.sessionFile}.hot`).size;
 		return size - (this.hotOffset ?? 0) + sidecar;
@@ -1045,12 +1049,16 @@ export class SessionManager {
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const hot = preloadedFileEntries ? null : loadHotSession(this.sessionFile);
-			const entries = preloadedFileEntries ?? hot?.entries ?? loadEntriesFromFile(this.sessionFile);
-			this.loadedFromHot = hot !== null;
-			this.coldCompactionCount = hot?.coldCompactionCount ?? 0;
-			this.coldUsageTotals = hot?.coldUsageTotals ?? createUsageTotals();
-			this.hotOffset = hot?.offset;
+			const index = preloadedFileEntries ? null : readOffsetIndex(this.sessionFile);
+			const indexed = index ? loadIndexedActiveSession(this.sessionFile, index) : null;
+			// A missing/inconsistent auxiliary index is allowed to trigger one full
+			// authoritative load and rebuild; never trust a partial projection.
+			const entries = preloadedFileEntries ?? indexed?.entries ?? loadEntriesFromFile(this.sessionFile);
+			this.loadedFromHot = indexed !== null;
+			this.coldCompactionCount = indexed?.coldCompactionCount ?? 0;
+			this.coldUsageTotals = indexed?.coldUsageTotals ?? createUsageTotals();
+			this.hotOffset = undefined;
+			this.indexedActiveBytes = indexed?.activeBytes;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1068,7 +1076,10 @@ export class SessionManager {
 
 			this._loadEntries(entries);
 			this.flushed = true;
-			if (!this.loadedFromHot) this._maybeSaveHotSession();
+			if (!indexed && !preloadedFileEntries) {
+				buildOffsetIndex(this.sessionFile, this.fileEntries);
+				this._maybeSaveHotSession();
+			}
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -1100,6 +1111,7 @@ export class SessionManager {
 		this.coldCompactionCount = 0;
 		this.coldUsageTotals = createUsageTotals();
 		this.hotOffset = undefined;
+		this.indexedActiveBytes = undefined;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1156,6 +1168,8 @@ export class SessionManager {
 		if (!entries.length || entries[0]?.type !== "session") throw new Error("Archived session is unavailable");
 		this.fileEntries = entries;
 		this.loadedFromHot = false;
+		this.indexedActiveBytes = undefined;
+		this.hotOffset = undefined;
 		this.coldCompactionCount = 0;
 		this.coldUsageTotals = createUsageTotals();
 		this._buildIndex();
@@ -1246,13 +1260,17 @@ export class SessionManager {
 		}
 		// Auxiliary snapshot only: the authoritative JSONL and watcher offset do
 		// not change, so BotMux keeps the same logical/native session binding.
-		if (saveHotSession(this.sessionFile, [header, ...compacted], coldCompactionCount, coldUsageTotals))
+		if (saveHotSession(this.sessionFile, [header, ...compacted], coldCompactionCount, coldUsageTotals)) {
+			this.indexedActiveBytes = undefined;
 			this.hotOffset = statSync(this.sessionFile).size;
+		}
 	}
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		this._materializeFullHistory();
+		try { unlinkSync(`${this.sessionFile}.idx`); } catch { /* absent */ }
+		this.indexedActiveBytes = undefined;
 		const fd = openSync(this.sessionFile, "w");
 		try {
 			for (const entry of this.fileEntries) {
@@ -1322,7 +1340,14 @@ export class SessionManager {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		const sizeBefore = this.indexedActiveBytes !== undefined && this.sessionFile && this.flushed
+			? statSync(this.sessionFile).size : 0;
 		this._persist(entry);
+		if (this.persist && this.sessionFile && this.flushed) {
+			if (!appendOffsetIndex(this.sessionFile, entry)) buildOffsetIndex(this.sessionFile, this.fileEntries);
+			if (this.indexedActiveBytes !== undefined)
+				this.indexedActiveBytes += statSync(this.sessionFile).size - sizeBefore;
+		}
 		if (entry.type === "compaction") this._maybeSaveHotSession();
 	}
 
@@ -1793,6 +1818,7 @@ export class SessionManager {
 		}
 		this.leafId = branchFromId;
 		this.hotOffset = undefined;
+		this.indexedActiveBytes = undefined;
 	}
 
 	/**
@@ -1804,6 +1830,7 @@ export class SessionManager {
 		this._materializeFullHistory();
 		this.leafId = null;
 		this.hotOffset = undefined;
+		this.indexedActiveBytes = undefined;
 	}
 
 	/**
