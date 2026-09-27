@@ -19,6 +19,7 @@ import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./usage-t
 
 const CHUNK_BYTES = 64 * 1024;
 const ANCHOR_BYTES = 8192;
+const MAX_INDEX_BYTES = 64 * 1024 * 1024;
 
 export interface OffsetRecord {
 	id: string;
@@ -75,10 +76,11 @@ function metadataFor(entry: SessionEntry, start: number, end: number): OffsetRec
 }
 
 function readPrivateIndex(path: string): Buffer {
-	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 	try {
 		const stat = fstatSync(fd);
-		if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error("Unsafe index metadata file");
+		if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > MAX_INDEX_BYTES)
+			throw new Error("Unsafe or oversized index metadata file");
 		return readFileSync(fd);
 	} finally {
 		closeSync(fd);
@@ -362,6 +364,8 @@ export function loadIndexedActiveSession(
 	coldUsageTotals: UsageTotals;
 	coldCompactionCount: number;
 	activeBytes: number;
+	latestAssistantSeen: boolean;
+	latestCacheHitRate?: number;
 } | null {
 	try {
 		const source = statSync(file);
@@ -402,6 +406,15 @@ export function loadIndexedActiveSession(
 		if (header.type !== "session" || header.id !== index.id) return null;
 		const prefix: SessionEntry[] = [];
 		let syntheticTitle: SessionEntry | undefined;
+		const title = index.records.findLast((record) => record.type === "session_info" && record.name !== undefined);
+		if (title && !selected.some((record) => record.id === title.id))
+			syntheticTitle = {
+				type: "session_info",
+				id: randomUUID(),
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				name: title.name,
+			};
 		if (compactIndex >= 0) {
 			let model: OffsetRecord["model"];
 			let thinkingLevel: string | undefined;
@@ -413,9 +426,6 @@ export function loadIndexedActiveSession(
 			if (model) prefix.push({ type: "model_change", id: randomUUID(), parentId: null, timestamp, ...model });
 			if (thinkingLevel && thinkingLevel !== "off")
 				prefix.push({ type: "thinking_level_change", id: randomUUID(), parentId: null, timestamp, thinkingLevel });
-			const title = index.records.findLast((record) => record.type === "session_info" && record.name !== undefined);
-			if (title)
-				syntheticTitle = { type: "session_info", id: randomUUID(), parentId: null, timestamp, name: title.name };
 		}
 		const bodies = selected.map((record) => {
 			const bytes = readAt(file, record.start, record.end - record.start);
@@ -473,11 +483,18 @@ export function loadIndexedActiveSession(
 			sourceAnchor(file, index.offset) !== index.anchor
 		)
 			return null;
+		const latestAssistant = index.records.findLast(
+			(record) => record.type === "message" && record.role === "assistant",
+		);
+		const usage = latestAssistant?.usage;
+		const prompt = usage ? usage.input + usage.cacheRead + usage.cacheWrite : 0;
 		return {
 			entries: [header, ...compacted],
 			coldUsageTotals,
 			coldCompactionCount,
 			activeBytes: selected.reduce((sum, record) => sum + record.end - record.start, 0),
+			latestAssistantSeen: latestAssistant !== undefined,
+			latestCacheHitRate: prompt > 0 ? (usage!.cacheRead / prompt) * 100 : undefined,
 		};
 	} catch {
 		return null;

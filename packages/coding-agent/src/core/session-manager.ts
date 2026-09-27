@@ -40,8 +40,13 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import { saveHotSession } from "./session-hot-store.ts";
-import { appendOffsetIndex, buildOffsetIndex, loadIndexedActiveSession, readOffsetIndex } from "./session-offset-index.ts";
 import { hydrateImageRefs, serializeWithImageRefs } from "./session-image-store.ts";
+import {
+	appendOffsetIndex,
+	buildOffsetIndex,
+	loadIndexedActiveSession,
+	readOffsetIndex,
+} from "./session-offset-index.ts";
 import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./usage-totals.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -1008,6 +1013,8 @@ export class SessionManager {
 	private coldUsageTotals: UsageTotals = createUsageTotals();
 	private hotOffset: number | undefined;
 	private indexedActiveBytes: number | undefined;
+	private indexedLatestAssistantSeen = false;
+	private indexedLatestCacheHitRate: number | undefined;
 	/** Bytes in the current active disk generation, independent of model tokens. */
 	getActiveDiskBytes(): number {
 		if (!this.sessionFile) return 0;
@@ -1059,6 +1066,8 @@ export class SessionManager {
 			this.coldUsageTotals = indexed?.coldUsageTotals ?? createUsageTotals();
 			this.hotOffset = undefined;
 			this.indexedActiveBytes = indexed?.activeBytes;
+			this.indexedLatestAssistantSeen = indexed?.latestAssistantSeen ?? false;
+			this.indexedLatestCacheHitRate = indexed?.latestCacheHitRate;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1112,6 +1121,8 @@ export class SessionManager {
 		this.coldUsageTotals = createUsageTotals();
 		this.hotOffset = undefined;
 		this.indexedActiveBytes = undefined;
+		this.indexedLatestAssistantSeen = false;
+		this.indexedLatestCacheHitRate = undefined;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1169,6 +1180,8 @@ export class SessionManager {
 		this.fileEntries = entries;
 		this.loadedFromHot = false;
 		this.indexedActiveBytes = undefined;
+		this.indexedLatestAssistantSeen = false;
+		this.indexedLatestCacheHitRate = undefined;
 		this.hotOffset = undefined;
 		this.coldCompactionCount = 0;
 		this.coldUsageTotals = createUsageTotals();
@@ -1197,7 +1210,10 @@ export class SessionManager {
 				latestCacheHitRate = prompt > 0 ? (entry.message.usage.cacheRead / prompt) * 100 : undefined;
 			}
 		}
-		return { totals, latestCacheHitRate };
+		return {
+			totals,
+			latestCacheHitRate: this.indexedLatestAssistantSeen ? this.indexedLatestCacheHitRate : latestCacheHitRate,
+		};
 	}
 
 	getCompactionCount(): number {
@@ -1269,7 +1285,11 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		this._materializeFullHistory();
-		try { unlinkSync(`${this.sessionFile}.idx`); } catch { /* absent */ }
+		try {
+			unlinkSync(`${this.sessionFile}.idx`);
+		} catch {
+			/* absent */
+		}
 		this.indexedActiveBytes = undefined;
 		const fd = openSync(this.sessionFile, "w");
 		try {
@@ -1340,9 +1360,19 @@ export class SessionManager {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		const sizeBefore = this.indexedActiveBytes !== undefined && this.sessionFile && this.flushed
-			? statSync(this.sessionFile).size : 0;
+		const sizeBefore =
+			this.indexedActiveBytes !== undefined && this.sessionFile && this.flushed
+				? statSync(this.sessionFile).size
+				: 0;
 		this._persist(entry);
+		if (this.indexedLatestAssistantSeen || this.loadedFromHot) {
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const usage = entry.message.usage;
+				const prompt = usage.input + usage.cacheRead + usage.cacheWrite;
+				this.indexedLatestCacheHitRate = prompt > 0 ? (usage.cacheRead / prompt) * 100 : undefined;
+				this.indexedLatestAssistantSeen = true;
+			}
+		}
 		if (this.persist && this.sessionFile && this.flushed) {
 			if (!appendOffsetIndex(this.sessionFile, entry)) buildOffsetIndex(this.sessionFile, this.fileEntries);
 			if (this.indexedActiveBytes !== undefined)
@@ -1625,9 +1655,9 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		if (fromId) this._materializeFullHistory();
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
-		if (fromId && !this.byId.has(fromId)) this._materializeFullHistory();
 		let current = startId ? this.byId.get(startId) : undefined;
 		while (current) {
 			path.push(current);
@@ -1812,7 +1842,9 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
-		if (!this.byId.has(branchFromId)) this._materializeFullHistory();
+		// Indexed entries are reparented for normal context. Historical branching
+		// must restore the original ancestry even if the target ID is already hot.
+		this._materializeFullHistory();
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1845,6 +1877,7 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
+		this._materializeFullHistory();
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1871,6 +1904,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this._materializeFullHistory();
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
