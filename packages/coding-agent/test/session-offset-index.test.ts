@@ -123,6 +123,16 @@ describe("session offset metadata index", () => {
     const index = readOffsetIndex(file)!;
     expect(index.records.slice(-2).map(record => record.id)).toEqual([second, third]);
     expect(loadIndexedActiveSession(file, index)?.entries.at(-1)?.type).toBe("message");
+    chmodSync(`${file}.idx.delta`, 0o644);
+    expect(readOffsetIndex(file)).toBeNull();
+    chmodSync(`${file}.idx.delta`, 0o600);
+    const moved = `${file}.idx.delta-copy`;
+    renameSync(`${file}.idx.delta`, moved);
+    symlinkSync(moved, `${file}.idx.delta`);
+    expect(readOffsetIndex(file)).toBeNull();
+    rmSync(`${file}.idx.delta`);
+    renameSync(moved, `${file}.idx.delta`);
+    expect(readOffsetIndex(file)).not.toBeNull();
     const source = readFileSync(file);
     writeFileSync(`${file}.idx.delta`, Buffer.concat([readFileSync(`${file}.idx.delta`), Buffer.from("{partial")]));
     expect(readOffsetIndex(file)).toBeNull();

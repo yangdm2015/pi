@@ -16,7 +16,7 @@ it("selectively resumes the same ID after an active append without parsing old o
   manager.appendMessage({ role: "user", content: `OLD-MARKER-${"x".repeat(400_000)}`, timestamp: now } as never);
   const kept = manager.appendMessage({ role: "user", content: "keep this", timestamp: now } as never);
   const compact = manager.appendCompaction("summary", kept, 100);
-  manager.appendMessage({ role: "user", content: `ABANDONED-MARKER-${"y".repeat(400_000)}`, timestamp: now } as never);
+  const abandonedId = manager.appendMessage({ role: "user", content: `ABANDONED-MARKER-${"y".repeat(400_000)}`, timestamp: now } as never);
   manager.branch(compact);
   manager.appendMessage({ role: "user", content: "live", timestamp: now } as never);
   const file = manager.getSessionFile()!;
@@ -55,6 +55,15 @@ it("selectively resumes the same ID after an active append without parsing old o
     return parse(text, ...(args as [any]));
   });
   expect(SessionManager.open(file).buildSessionContext()).toEqual(fallback.buildSessionContext());
+  vi.restoreAllMocks();
+  // An explicit historical lookup still returns the original, unmodified entry.
+  const selected = SessionManager.open(file);
+  expect(selected.getActiveEntries().some(e => e.id === abandonedId)).toBe(false);
+  const raw = selected.getEntry(abandonedId);
+  expect(raw?.type).toBe("message");
+  expect(raw?.type === "message" && raw.message.role === "user" && raw.message.content).toContain("ABANDONED-MARKER-");
+  expect(selected.getLeafId()).toBe(again.getLeafId());
+  expect(selected.getEntries()).toEqual(fallback.getEntries());
 });
 
 it("a crash-length stale or corrupt index falls back to the authoritative JSONL once", () => {
