@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -55,4 +55,25 @@ it("selectively resumes the same ID after an active append without parsing old o
     return parse(text, ...(args as [any]));
   });
   expect(SessionManager.open(file).buildSessionContext()).toEqual(fallback.buildSessionContext());
+});
+
+it("a crash-length stale or corrupt index falls back to the authoritative JSONL once", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-torn-index-")); dirs.push(cwd);
+  const manager = SessionManager.create(cwd, cwd);
+  manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() } as never);
+  const file = manager.getSessionFile()!;
+  const before = readFileSync(file);
+  const lastId = manager.getLeafId();
+  appendFileSync(file, `${JSON.stringify({ type: "message", id: "unindexed-last", parentId: lastId,
+    timestamp: new Date().toISOString(), message: { role: "user", content: "after crash", timestamp: Date.now() } })}\n`);
+  const recovered = SessionManager.open(file);
+  expect(recovered.getLeafId()).toBe("unindexed-last");
+  expect(recovered.buildSessionContext().messages.some(m => m.role === "user" && m.content === "after crash")).toBe(true);
+  const sourceAfterRecovery = readFileSync(file);
+  expect(sourceAfterRecovery.subarray(0, before.length)).toEqual(before);
+  writeFileSync(`${file}.idx`, "{broken", { mode: 0o600 });
+  const recoveredAgain = SessionManager.open(file);
+  expect(recoveredAgain.getLeafId()).toBe("unindexed-last");
+  expect(readFileSync(file)).toEqual(sourceAfterRecovery);
+  expect(SessionManager.open(file).buildSessionContext()).toEqual(recoveredAgain.buildSessionContext());
 });

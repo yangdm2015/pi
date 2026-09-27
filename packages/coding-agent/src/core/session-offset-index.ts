@@ -242,6 +242,7 @@ export function loadIndexedActiveSession(file: string, index: OffsetIndex): {
 		const header = JSON.parse(readAt(file, 0, headerEnd - 1).toString("utf8")) as SessionHeader;
 		if (header.type !== "session" || header.id !== index.id) return null;
 		const prefix: SessionEntry[] = [];
+		let syntheticTitle: SessionEntry | undefined;
 		if (compactIndex >= 0) {
 			let model: OffsetRecord["model"];
 			let thinkingLevel: string | undefined;
@@ -254,7 +255,7 @@ export function loadIndexedActiveSession(file: string, index: OffsetIndex): {
 			if (thinkingLevel && thinkingLevel !== "off")
 				prefix.push({ type: "thinking_level_change", id: randomUUID(), parentId: null, timestamp, thinkingLevel });
 			const title = index.records.findLast(record => record.type === "session_info" && record.name !== undefined);
-			if (title) prefix.push({ type: "session_info", id: randomUUID(), parentId: null, timestamp, name: title.name });
+			if (title) syntheticTitle = { type: "session_info", id: randomUUID(), parentId: null, timestamp, name: title.name };
 		}
 		const bodies = selected.map(record => {
 			const bytes = readAt(file, record.start, record.end - record.start);
@@ -279,8 +280,8 @@ export function loadIndexedActiveSession(file: string, index: OffsetIndex): {
 		// Preserve the real last entry as the leaf; synthetic latest label state
 		// goes after earlier selected labels, before that leaf.
 		const active = bodies.length
-			? [...prefix, ...bodies.slice(0, -1), ...syntheticLabels, bodies.at(-1)!]
-			: [...prefix, ...syntheticLabels];
+			? [...prefix, ...bodies.slice(0, -1), ...(syntheticTitle ? [syntheticTitle] : []), ...syntheticLabels, bodies.at(-1)!]
+			: [...prefix, ...(syntheticTitle ? [syntheticTitle] : []), ...syntheticLabels];
 		const coldUsageTotals = createUsageTotals();
 		let coldCompactionCount = 0;
 		for (const record of index.records) {
