@@ -193,6 +193,10 @@ describe("session offset metadata index", () => {
 		renameSync(moved, `${file}.idx.delta`);
 		expect(readOffsetIndex(file)).not.toBeNull();
 		const source = readFileSync(file);
+		writeFileSync(file, source.toString("utf8").replace('"third"', '"other"'));
+		expect(readOffsetIndex(file)).toBeNull();
+		writeFileSync(file, source);
+		expect(readOffsetIndex(file)).not.toBeNull();
 		writeFileSync(`${file}.idx.delta`, Buffer.concat([readFileSync(`${file}.idx.delta`), Buffer.from("{partial")]));
 		expect(readOffsetIndex(file)).toBeNull();
 		expect(readFileSync(file)).toEqual(source);

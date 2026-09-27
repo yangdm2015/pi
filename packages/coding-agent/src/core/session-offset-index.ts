@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	closeSync,
 	constants,
+	fstatSync,
 	lstatSync,
 	openSync,
 	readFileSync,
@@ -73,8 +74,19 @@ function metadataFor(entry: SessionEntry, start: number, end: number): OffsetRec
 	return record;
 }
 
+function readPrivateIndex(path: string): Buffer {
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		const stat = fstatSync(fd);
+		if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error("Unsafe index metadata file");
+		return readFileSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
 function readAt(file: string, offset: number, length: number): Buffer {
-	const fd = openSync(file, "r");
+	const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
 	try {
 		const result = Buffer.alloc(length);
 		if (readSync(fd, result, 0, length, offset) !== length) throw new Error("Incomplete session source");
@@ -183,7 +195,7 @@ export function readOffsetIndex(file: string, allowAppendedSource = false): Offs
 			(side.mode & 0o077) !== 0
 		)
 			return null;
-		const index = JSON.parse(readFileSync(`${file}.idx`, "utf8")) as OffsetIndex;
+		const index = JSON.parse(readPrivateIndex(`${file}.idx`).toString("utf8")) as OffsetIndex;
 		const { checksum, ...payload } = index;
 		if (
 			typeof checksum !== "string" ||
@@ -238,7 +250,7 @@ export function readOffsetIndex(file: string, allowAppendedSource = false): Offs
 		try {
 			const delta = lstatSync(`${file}.idx.delta`);
 			if (!delta.isFile() || delta.isSymbolicLink() || (delta.mode & 0o077) !== 0) return null;
-			journal = readFileSync(`${file}.idx.delta`);
+			journal = readPrivateIndex(`${file}.idx.delta`);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
 		}
