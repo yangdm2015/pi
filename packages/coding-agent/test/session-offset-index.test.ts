@@ -90,6 +90,49 @@ describe("session offset metadata index", () => {
     } finally { spy.mockRestore(); }
   });
 
+  it("preserves context-edit projection and raw history on the current path", () => {
+    const { dir } = fixture();
+    const manager = SessionManager.create(dir, dir);
+    const target = manager.appendMessage({ role: "user", content: `OMITTED-BODY-${"z".repeat(512 * 1024)}`, timestamp: Date.now() } as never);
+    manager.appendContextEdit(target, null);
+    manager.appendMessage({ role: "user", content: "live", timestamp: Date.now() } as never);
+    const expected = manager.buildSessionContext();
+    const file = manager.getSessionFile()!;
+    expect(buildOffsetIndex(file, [manager.getHeader()!, ...manager.getEntries()])).toBe(true);
+    const loaded = loadIndexedActiveSession(file, readOffsetIndex(file)!);
+    expect(loaded).not.toBeNull();
+    const entries = loaded!.entries.slice(1) as Parameters<typeof buildSessionContext>[0];
+    expect(buildSessionContext(entries)).toEqual(expected);
+    expect(entries.find(entry => entry.id === target && entry.type === "message")?.type).toBe("message");
+    // Pi's TUI renders raw current-path entries even when a context_edit omits
+    // their content from model input. The original is therefore still needed.
+    expect(JSON.stringify(entries)).toContain("OMITTED-BODY-");
+  });
+
+  it("appends offset metadata without rewriting the snapshot and rejects a torn journal", () => {
+    const { dir } = fixture();
+    const manager = SessionManager.create(dir, dir);
+    manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() } as never);
+    const file = manager.getSessionFile()!;
+    expect(buildOffsetIndex(file, [manager.getHeader()!, ...manager.getEntries()])).toBe(true);
+    const snapshot = readFileSync(`${file}.idx`);
+    const second = manager.appendMessage({ role: "user", content: "second", timestamp: Date.now() } as never);
+    const third = manager.appendMessage({ role: "user", content: "third", timestamp: Date.now() } as never);
+    expect(readFileSync(`${file}.idx`)).toEqual(snapshot);
+    expect(statSync(`${file}.idx.delta`).mode & 0o077).toBe(0);
+    const index = readOffsetIndex(file)!;
+    expect(index.records.slice(-2).map(record => record.id)).toEqual([second, third]);
+    expect(loadIndexedActiveSession(file, index)?.entries.at(-1)?.type).toBe("message");
+    const source = readFileSync(file);
+    writeFileSync(`${file}.idx.delta`, Buffer.concat([readFileSync(`${file}.idx.delta`), Buffer.from("{partial")]));
+    expect(readOffsetIndex(file)).toBeNull();
+    expect(readFileSync(file)).toEqual(source);
+    const recovered = SessionManager.open(file);
+    expect(recovered.getLeafId()).toBe(third);
+    expect(readOffsetIndex(file)?.records.at(-1)?.id).toBe(third);
+    expect(readFileSync(file)).toEqual(source);
+  });
+
   it("rejects incomplete source lines and invalid indexes without editing the original", () => {
     const { file, entries } = fixture();
     const before = readFileSync(file);
