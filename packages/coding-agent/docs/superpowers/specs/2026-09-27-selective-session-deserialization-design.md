@@ -6,6 +6,10 @@ On ordinary continuation and cold recovery of an existing logical Pi session, de
 
 Keep the same BotMux session ID and Pi `botmux_<id>.jsonl` path; do not rewrite active or old authoritative JSONL for deployment. Image blobs remain lazy. No daemon or live robot is changed as part of isolated development.
 
+## Product boundary discovered during review
+
+This design governs **disk deserialization at cold open**, not what the model can recall from an arbitrary old turn. Feishu/terminal viewing and scrolling cannot indicate which past message the user might refer to in their next text. Summaries and active entries can omit old details. Do **not** implement TUI viewport-triggered history loading as a substitute for conversation recall. A separate user-approved design is required for on-demand historical retrieval (exact Feishu reply IDs when available, content/time search for vague references, and explicit uncertainty/clarification when no match can be proven). Until that is designed and tested, selective cold loading must not be advertised as preserving arbitrary exact old-message recall.
+
 ## Current gap
 
 The deployed Pi 0.87.1 fork's `.jsonl.hot` is an optional compacted-branch snapshot, updated on eligible compactions and after a full cold load. A valid snapshot is parsed whole, followed by `JSON.parse` of **every** physical line after its offset, even if lines belong to other branches. With no valid snapshot the full source is parsed; this fallback is now explicitly permitted. The card's present `hot size + tail bytes` is an estimate for that *old* loader, not a measure of selective-body parsing after this change.
