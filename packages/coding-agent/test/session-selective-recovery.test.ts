@@ -74,6 +74,31 @@ it("selectively resumes the same ID after an active append without parsing old o
 	expect(selected.getEntries()).toEqual(fallback.getEntries());
 });
 
+it("keeps a complete uncompacted active branch without parsing an abandoned sibling", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-no-compaction-"));
+	dirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	const root = manager.appendMessage({ role: "user", content: "root", timestamp: Date.now() } as never);
+	manager.appendMessage({
+		role: "user",
+		content: `SIBLING-MARKER-${"s".repeat(400_000)}`,
+		timestamp: Date.now(),
+	} as never);
+	manager.branch(root);
+	manager.appendMessage({ role: "user", content: "current", timestamp: Date.now() } as never);
+	const expected = manager.buildSessionContext();
+	const file = manager.getSessionFile()!;
+	expect(buildOffsetIndex(file, [manager.getHeader()!, ...manager.getEntries()])).toBe(true);
+	const parse = JSON.parse;
+	vi.spyOn(JSON, "parse").mockImplementation((text: string, ...args: unknown[]) => {
+		if (typeof text === "string" && text.includes("SIBLING-MARKER-")) throw new Error("parsed abandoned sibling");
+		return parse(text, ...(args as [any]));
+	});
+	const recovered = SessionManager.open(file);
+	expect(recovered.buildSessionContext()).toEqual(expected);
+	expect(recovered.buildContextEntries().filter((entry) => entry.type === "message")).toHaveLength(2);
+});
+
 it("a crash-length stale or corrupt index falls back to the authoritative JSONL once", () => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-torn-index-"));
 	dirs.push(cwd);
