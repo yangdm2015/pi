@@ -1,0 +1,31 @@
+# Selective deserialization of Pi session JSONL — design (2026-09-27)
+
+## Confirmed requirement and scope
+
+On ordinary continuation and cold recovery of an existing logical Pi session, deserialize JSONL **bodies only for entries needed by the current branch/context**. A growing append-only source must not force unrelated old messages or branches through `JSON.parse`. If the auxiliary lookup data is absent, stale, corrupted, or cannot be reconciled, a **full authoritative JSONL load is allowed**; rebuild the auxiliary data only after that load is validated. Explicit full-history export, tree enumeration, and navigation into old history can intentionally read the requested history. There is no promise that the *necessary* active context fits a fixed byte cap: compaction still controls model-context size, and one necessary message may itself be huge.
+
+Keep the same BotMux session ID and Pi `botmux_<id>.jsonl` path; do not rewrite active or old authoritative JSONL for deployment. Image blobs remain lazy. No daemon or live robot is changed as part of isolated development.
+
+## Current gap
+
+The deployed Pi 0.87.1 fork's `.jsonl.hot` is an optional compacted-branch snapshot, updated on eligible compactions and after a full cold load. A valid snapshot is parsed whole, followed by `JSON.parse` of **every** physical line after its offset, even if lines belong to other branches. With no valid snapshot the full source is parsed; this fallback is now explicitly permitted. The card's present `hot size + tail bytes` is an estimate for that *old* loader, not a measure of selective-body parsing after this change.
+
+## Alternatives
+
+1. **Recommended — append-only offset/metadata index alongside the original JSONL.** For each new persisted line, record its ID, parent ID, entry kind, source byte offset/length, and the minimal non-body metadata needed for labels, totals, model/thinking selection and branch reconstruction. The index is private and versioned. On restart, validate file identity, header, exact indexed end offset and a bounded source boundary anchor. Walk indexed parent links from the current leaf; honor the most recent compaction, `firstKeptEntryId`, branch summaries and context edits; seek and parse only selected JSONL entry bodies. The compact index may contain metadata for the full tree; it must not duplicate old message/tool/image bodies. **Metadata lookup is not full body deserialization.** A missing/bad/incomplete index follows the allowed full-load-and-rebuild path. Explicit historical APIs may hydrate further records on demand.
+2. Refresh `.hot` at a smaller interval. This limits but does not eliminate the parsing of unrelated entries after the offset and can repeatedly rewrite large active snapshots; it does not meet the literal selection requirement.
+3. Split/rotate the original JSONL. It changes file identity and BotMux discovery/recovery semantics and adds a multi-file handoff. Out of scope.
+
+## Data, ordering and failure boundaries
+
+- Source JSONL remains authoritative. Persist a source line first, then its matching index metadata. An interrupted write, partial line, short/out-of-order index, source replacement, changed inode, failed anchor, wrong session ID or changed index version makes the index untrusted; **never silently omit an entry**. Full-load-and-rebuild is allowed in these cases. Rebuilding writes a private temporary index and atomically publishes it only after source identity and size are rechecked. Do not overwrite the old JSONL.
+- The first eligible cold load of an old session with no index necessarily uses the permitted full parse once. Subsequent ordinary cold loads use the index while it is valid. A live session already holds the active branch in memory and should not deserialize the source afresh per turn.
+- The index must capture enough state to preserve cumulative usage/cost, current model/thinking, labels and active-leaf semantics without JSON-parsing all cold bodies. When there is no valid compaction, all entries genuinely on the active branch may be required; never silently truncate that branch to satisfy a byte target. Define `context_edit` targets and `firstKeptEntryId` resolution from metadata before seeking bodies. Branch navigation into archived nodes can use explicit on-demand hydration; never invent a parent or silently use a different branch.
+- The index is a performance hint, not an authority or an authenticated proof that arbitrary ancient source bytes have never changed. The design assumes append-only source plus checked identity/size/header/boundary, as with the existing hot sidecar. Private permissions, no-follow checks, bounded line parsing and crash tests are required. Process-crash atomicity must not be described as power-loss durability.
+- Compatibility: preserve current `.hot` as a legacy acceleration/fallback during transition only if it cannot introduce unrelated-body parsing on the *healthy indexed path*. A full fallback and index rebuild are permitted when the index is absent/invalid; do not label an oversized or perpetually stale index as a successful healthy path.
+
+## API and acceptance
+
+Introduce an indexed session-load boundary in `SessionManager`; do not change the public session ID, SDK session-file contract or model-visible active context. Update the BotMux card estimator only after measuring the new loader's actual selected-body byte count; until then do not claim the old `.hot + tail` metric represents the new loader.
+
+Focused tests use two branches with large unrelated tool payloads after a compaction, old model/label/usage entries, `context_edit`, late appends and a necessary oversized entry. Instrument JSON parsing/read offsets to prove unrelated message **bodies** are not deserialized on the healthy cold path, while resulting context, leaf, totals, labels and exported history match the full loader. Test no index, invalid checksum/identity, torn source/index writes, malformed or oversize entry, branch navigation, restart after index rebuild, images and no-compaction sessions. Compare the 0.87.1 fork's relevant suites and build; an isolated fake-worker/same-ID cold-recovery smoke precedes any BotMux rollout. Never rewrite existing live JSONL for tests.
