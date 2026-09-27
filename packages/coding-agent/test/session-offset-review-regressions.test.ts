@@ -1,7 +1,8 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "../src/core/compaction/compaction.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { buildOffsetIndex } from "../src/core/session-offset-index.js";
 
@@ -78,6 +79,65 @@ it("keeps the physical latest assistant cache-hit rate after compaction and subs
 	recovered.appendMessage(assistant(15));
 	expect(recovered.getUsageSnapshot()).toEqual(SessionManager.open(recovered.getSessionFile()!).getUsageSnapshot());
 	expect(recovered.getUsageSnapshot().latestCacheHitRate).toBe(75);
+});
+
+it("never selects an in-memory synthetic ID as a persisted compaction boundary", () => {
+	const manager = session();
+	const root = manager.appendMessage(message("A ".repeat(300)));
+	manager.appendSessionInfo("off-branch title");
+	manager.branch(root);
+	const kept = manager.appendMessage(message("B ".repeat(300)));
+	manager.appendCompaction("old summary", kept, 200);
+	manager.appendMessage(message("C ".repeat(300)));
+	const recovered = indexed(manager);
+	const synthetic = recovered
+		.getBranch()
+		.filter((e) => (e as typeof e & { __offsetSynthetic?: boolean }).__offsetSynthetic)
+		.map((e) => e.id);
+	expect(synthetic.length).toBeGreaterThan(0);
+	let preparedCount = 0;
+	for (const keepRecentTokens of [1, 10, 100, 400]) {
+		const prepared = prepareCompaction(recovered.getBranch(), { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens });
+		if (prepared) {
+			preparedCount++;
+			expect(synthetic).not.toContain(prepared.firstKeptEntryId);
+		}
+	}
+	expect(preparedCount).toBeGreaterThan(0);
+});
+
+it("does not full-load old bodies to fetch a newly appended entry", () => {
+	const manager = session();
+	manager.appendMessage(message(`OLD-${"x".repeat(400000)}`));
+	const kept = manager.appendMessage(message("kept"));
+	manager.appendCompaction("summary", kept, 100);
+	const recovered = indexed(manager);
+	const latest = recovered.appendMessage(message("new"));
+	const parse = JSON.parse;
+	const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, ...args: unknown[]) => {
+		if (typeof text === "string" && text.includes("OLD-")) throw new Error("unnecessary full history read");
+		return parse(text, ...(args as [any]));
+	});
+	try {
+		expect(recovered.getEntry(latest)?.id).toBe(latest);
+	} finally {
+		spy.mockRestore();
+	}
+});
+
+it("preserves explicit thinking off and a cleared global title", () => {
+	const manager = session();
+	manager.appendMessage(message("root"));
+	manager.appendSessionInfo("old title");
+	manager.appendThinkingLevelChange("off");
+	const kept = manager.appendMessage(message("kept"));
+	manager.appendCompaction("summary", kept, 100);
+	manager.appendSessionInfo("");
+	const recovered = indexed(manager);
+	expect(recovered.getSessionName()).toBeUndefined();
+	expect(recovered.getBranch().some((e) => e.type === "thinking_level_change" && e.thinkingLevel === "off")).toBe(
+		true,
+	);
 });
 
 it("preserves a globally latest session title on an uncompacted abandoned branch", () => {

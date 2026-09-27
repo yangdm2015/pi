@@ -1015,6 +1015,7 @@ export class SessionManager {
 	private indexedActiveBytes: number | undefined;
 	private indexedLatestAssistantSeen = false;
 	private indexedLatestCacheHitRate: number | undefined;
+	private indexedOriginalParents: Map<string, string | null> | undefined;
 	/** Bytes in the current active disk generation, independent of model tokens. */
 	getActiveDiskBytes(): number {
 		if (!this.sessionFile) return 0;
@@ -1068,6 +1069,8 @@ export class SessionManager {
 			this.indexedActiveBytes = indexed?.activeBytes;
 			this.indexedLatestAssistantSeen = indexed?.latestAssistantSeen ?? false;
 			this.indexedLatestCacheHitRate = indexed?.latestCacheHitRate;
+			this.indexedOriginalParents =
+				indexed && index ? new Map(index.records.map((record) => [record.id, record.parentId])) : undefined;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1123,6 +1126,7 @@ export class SessionManager {
 		this.indexedActiveBytes = undefined;
 		this.indexedLatestAssistantSeen = false;
 		this.indexedLatestCacheHitRate = undefined;
+		this.indexedOriginalParents = undefined;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1182,6 +1186,7 @@ export class SessionManager {
 		this.indexedActiveBytes = undefined;
 		this.indexedLatestAssistantSeen = false;
 		this.indexedLatestCacheHitRate = undefined;
+		this.indexedOriginalParents = undefined;
 		this.hotOffset = undefined;
 		this.coldCompactionCount = 0;
 		this.coldUsageTotals = createUsageTotals();
@@ -1596,7 +1601,15 @@ export class SessionManager {
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		if (!this.byId.has(id)) this._materializeFullHistory();
+		const entry = this.byId.get(id);
+		// A selected entry can have a synthetic parent; a newly appended entry
+		// already has its real parent and must not force a full read every turn.
+		if (
+			!entry ||
+			(entry as SessionEntry & { __offsetSynthetic?: boolean }).__offsetSynthetic ||
+			(this.indexedOriginalParents?.has(id) && entry.parentId !== this.indexedOriginalParents.get(id))
+		)
+			this._materializeFullHistory();
 		return this.byId.get(id);
 	}
 

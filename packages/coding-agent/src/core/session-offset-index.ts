@@ -406,7 +406,7 @@ export function loadIndexedActiveSession(
 		if (header.type !== "session" || header.id !== index.id) return null;
 		const prefix: SessionEntry[] = [];
 		let syntheticTitle: SessionEntry | undefined;
-		const title = index.records.findLast((record) => record.type === "session_info" && record.name !== undefined);
+		const title = index.records.findLast((record) => record.type === "session_info");
 		if (title && !selected.some((record) => record.id === title.id))
 			syntheticTitle = {
 				type: "session_info",
@@ -414,7 +414,8 @@ export function loadIndexedActiveSession(
 				parentId: null,
 				timestamp: new Date().toISOString(),
 				name: title.name,
-			};
+				__offsetSynthetic: true,
+			} as SessionEntry;
 		if (compactIndex >= 0) {
 			let model: OffsetRecord["model"];
 			let thinkingLevel: string | undefined;
@@ -423,9 +424,24 @@ export function loadIndexedActiveSession(
 				if (record.thinkingLevel) thinkingLevel = record.thinkingLevel;
 			}
 			const timestamp = new Date().toISOString();
-			if (model) prefix.push({ type: "model_change", id: randomUUID(), parentId: null, timestamp, ...model });
-			if (thinkingLevel && thinkingLevel !== "off")
-				prefix.push({ type: "thinking_level_change", id: randomUUID(), parentId: null, timestamp, thinkingLevel });
+			if (model)
+				prefix.push({
+					type: "model_change",
+					id: randomUUID(),
+					parentId: null,
+					timestamp,
+					...model,
+					__offsetSynthetic: true,
+				} as SessionEntry);
+			if (thinkingLevel !== undefined)
+				prefix.push({
+					type: "thinking_level_change",
+					id: randomUUID(),
+					parentId: null,
+					timestamp,
+					thinkingLevel,
+					__offsetSynthetic: true,
+				} as SessionEntry);
 		}
 		const bodies = selected.map((record) => {
 			const bytes = readAt(file, record.start, record.end - record.start);
@@ -451,7 +467,8 @@ export function loadIndexedActiveSession(
 				timestamp: record.label.timestamp,
 				targetId: record.label.targetId,
 				label: record.label.value,
-			});
+				__offsetSynthetic: true,
+			} as SessionEntry);
 		}
 		// Preserve the real last entry as the leaf; synthetic latest label state
 		// goes after earlier selected labels, before that leaf.

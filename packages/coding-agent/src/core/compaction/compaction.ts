@@ -919,7 +919,16 @@ export function prepareCompaction(
 	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
 	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
-	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
+	// The indexed cold projection may contain in-memory metadata carriers for
+	// model/title/label state. Never persist their IDs as compaction boundaries:
+	// they do not exist in the authoritative append-only JSONL.
+	let firstKeptIndex = cutPoint.firstKeptEntryIndex;
+	while (
+		(projectedEntries[firstKeptIndex]?.sourceEntry as (SessionEntry & { __offsetSynthetic?: boolean }) | undefined)
+			?.__offsetSynthetic
+	)
+		firstKeptIndex++;
+	const firstKeptEntry = projectedEntries[firstKeptIndex]?.sourceEntry;
 	if (!firstKeptEntry?.id) return undefined;
 	const firstKeptEntryId = firstKeptEntry.id;
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
