@@ -43,8 +43,11 @@ import { saveHotSession } from "./session-hot-store.ts";
 import { hydrateImageRefs, serializeWithImageRefs } from "./session-image-store.ts";
 import {
 	appendOffsetIndex,
+	appendOffsetIndexWithCursor,
 	buildOffsetIndex,
+	createOffsetIndexAppendCursor,
 	loadIndexedActiveSession,
+	type OffsetIndexAppendCursor,
 	readOffsetIndex,
 } from "./session-offset-index.ts";
 import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./usage-totals.ts";
@@ -1016,6 +1019,8 @@ export class SessionManager {
 	private indexedLatestAssistantSeen = false;
 	private indexedLatestCacheHitRate: number | undefined;
 	private indexedOriginalParents: Map<string, string | null> | undefined;
+	private offsetIndexAppendCursor: OffsetIndexAppendCursor | undefined;
+	private indexUnsupported = false;
 	/** Bytes in the current active disk generation, independent of model tokens. */
 	getActiveDiskBytes(): number {
 		if (!this.sessionFile) return 0;
@@ -1056,6 +1061,8 @@ export class SessionManager {
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
+		this.offsetIndexAppendCursor = undefined;
+		this.indexUnsupported = false;
 		if (existsSync(this.sessionFile)) {
 			const index = preloadedFileEntries ? null : readOffsetIndex(this.sessionFile);
 			const indexed = index ? loadIndexedActiveSession(this.sessionFile, index) : null;
@@ -1088,8 +1095,11 @@ export class SessionManager {
 
 			this._loadEntries(entries);
 			this.flushed = true;
-			if (!indexed && !preloadedFileEntries) {
-				buildOffsetIndex(this.sessionFile, this.fileEntries);
+			if (indexed && index) {
+				this.offsetIndexAppendCursor = createOffsetIndexAppendCursor(this.sessionFile, index) ?? undefined;
+			} else if (!preloadedFileEntries) {
+				if (buildOffsetIndex(this.sessionFile, this.fileEntries)) this._seedOffsetIndexAppendCursor();
+				else this.indexUnsupported = true;
 				this._maybeSaveHotSession();
 			}
 		} else {
@@ -1127,6 +1137,8 @@ export class SessionManager {
 		this.indexedLatestAssistantSeen = false;
 		this.indexedLatestCacheHitRate = undefined;
 		this.indexedOriginalParents = undefined;
+		this.offsetIndexAppendCursor = undefined;
+		this.indexUnsupported = false;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1178,6 +1190,12 @@ export class SessionManager {
 	 * model-context reconstruction stays on the compact active branch. */
 	private _materializeFullHistory(): void {
 		if (!this.loadedFromHot || !this.sessionFile) return;
+		this._reloadAuthoritativeHistory();
+	}
+
+	/** Reload after an external source change even if memory used to be complete. */
+	private _reloadAuthoritativeHistory(): void {
+		if (!this.sessionFile) throw new Error("Session file is unavailable");
 		const leaf = this.leafId;
 		const entries = loadEntriesFromFile(this.sessionFile);
 		if (!entries.length || entries[0]?.type !== "session") throw new Error("Archived session is unavailable");
@@ -1289,6 +1307,8 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
+		this.offsetIndexAppendCursor = undefined;
+		this.indexUnsupported = false;
 		this._materializeFullHistory();
 		try {
 			unlinkSync(`${this.sessionFile}.idx`);
@@ -1342,6 +1362,18 @@ export class SessionManager {
 		);
 	}
 
+	private _newEntryId(): string {
+		return generateId({ has: (id) => this.byId.has(id) || (this.offsetIndexAppendCursor?.ids.has(id) ?? false) });
+	}
+
+	private _seedOffsetIndexAppendCursor(): void {
+		if (!this.sessionFile) return;
+		const index = readOffsetIndex(this.sessionFile);
+		this.offsetIndexAppendCursor = index
+			? (createOffsetIndexAppendCursor(this.sessionFile, index) ?? undefined)
+			: undefined;
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
@@ -1379,7 +1411,20 @@ export class SessionManager {
 			}
 		}
 		if (this.persist && this.sessionFile && this.flushed) {
-			if (!appendOffsetIndex(this.sessionFile, entry)) buildOffsetIndex(this.sessionFile, this.fileEntries);
+			if (!this.indexUnsupported) {
+				const appended =
+					this.offsetIndexAppendCursor &&
+					appendOffsetIndexWithCursor(this.sessionFile, entry, this.offsetIndexAppendCursor);
+				if (!appended) {
+					this.offsetIndexAppendCursor = undefined;
+					if (!appendOffsetIndex(this.sessionFile, entry)) {
+						// The source may have changed even when memory was previously complete.
+						this._reloadAuthoritativeHistory();
+						if (!buildOffsetIndex(this.sessionFile, this.fileEntries)) this.indexUnsupported = true;
+					}
+					if (!this.indexUnsupported) this._seedOffsetIndexAppendCursor();
+				}
+			}
 			if (this.indexedActiveBytes !== undefined)
 				this.indexedActiveBytes += statSync(this.sessionFile).size - sizeBefore;
 		}
@@ -1395,7 +1440,7 @@ export class SessionManager {
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -1408,7 +1453,7 @@ export class SessionManager {
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
@@ -1421,7 +1466,7 @@ export class SessionManager {
 	appendModelChange(provider: string, modelId: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			provider,
@@ -1435,7 +1480,7 @@ export class SessionManager {
 	appendUsage(kind: string, provider: string, model: string, usage: Usage, note?: string): UsageEntry {
 		const entry: UsageEntry = {
 			type: "usage",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			kind,
@@ -1459,7 +1504,7 @@ export class SessionManager {
 	): string {
 		const timestamp = new Date().toISOString();
 		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
-		const id = generateId(this.byId);
+		const id = this._newEntryId();
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			id,
@@ -1483,7 +1528,7 @@ export class SessionManager {
 			type: "custom",
 			customType,
 			data,
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -1496,7 +1541,7 @@ export class SessionManager {
 		const sanitizedName = name.replace(/[\r\n]+/g, " ").trim();
 		const entry: SessionInfoEntry = {
 			type: "session_info",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			name: sanitizedName,
@@ -1539,7 +1584,7 @@ export class SessionManager {
 			content,
 			display,
 			details,
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -1578,7 +1623,7 @@ export class SessionManager {
 				: replacement;
 		const entry: ContextEditEntry = {
 			type: "context_edit",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -1645,7 +1690,7 @@ export class SessionManager {
 		}
 		const entry: LabelEntry = {
 			type: "label",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -1908,7 +1953,7 @@ export class SessionManager {
 		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
 			fromId,

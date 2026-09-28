@@ -3,12 +3,126 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { SessionManager } from "../src/core/session-manager.js";
-import { buildOffsetIndex } from "../src/core/session-offset-index.js";
+import { buildOffsetIndex, readOffsetIndex } from "../src/core/session-offset-index.js";
 
 const dirs: string[] = [];
 afterEach(() => {
 	vi.restoreAllMocks();
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+it("keeps normal indexed appends off the full historical index parse", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-cursor-"));
+	dirs.push(cwd);
+	const first = SessionManager.create(cwd, cwd);
+	first.appendMessage({ role: "user", content: "start", timestamp: Date.now() } as never);
+	first.appendSessionInfo("HISTORIC-INDEX-MARKER");
+	const file = first.getSessionFile()!;
+	const second = SessionManager.open(file);
+	const originalParse = JSON.parse;
+	const parseSpy = vi.spyOn(JSON, "parse").mockImplementation((text: string, ...args: unknown[]) => {
+		if (typeof text === "string" && text.includes("HISTORIC-INDEX-MARKER"))
+			throw new Error("re-parsed historical index or source");
+		return originalParse(text, ...(args as [any]));
+	});
+	try {
+		second.appendMessage({ role: "user", content: "new message", timestamp: Date.now() } as never);
+	} finally {
+		parseSpy.mockRestore();
+	}
+	expect(SessionManager.open(file).getLeafId()).toBe(second.getLeafId());
+});
+
+it("recovers a torn live journal from the authoritative source without dropping cold history", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-cursor-torn-"));
+	dirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	manager.appendMessage({ role: "user", content: "old archived content", timestamp: Date.now() } as never);
+	const file = manager.getSessionFile()!;
+	const cold = SessionManager.open(file);
+	const before = readFileSync(file);
+	appendFileSync(`${file}.idx.delta`, "{torn");
+	const latest = cold.appendMessage({ role: "user", content: "new turn", timestamp: Date.now() } as never);
+	expect(readFileSync(file).subarray(0, before.length)).toEqual(before);
+	const restarted = SessionManager.open(file);
+	expect(restarted.getLeafId()).toBe(latest);
+	expect(
+		restarted
+			.getEntries()
+			.some(
+				(e) => e.type === "message" && e.message.role === "user" && e.message.content === "old archived content",
+			),
+	).toBe(true);
+});
+
+it("handles two live managers sharing a file without skipping an interleaved record", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-cursor-interleave-"));
+	dirs.push(cwd);
+	const initial = SessionManager.create(cwd, cwd);
+	initial.appendMessage({ role: "user", content: "root", timestamp: Date.now() } as never);
+	const file = initial.getSessionFile()!;
+	const first = SessionManager.open(file);
+	const second = SessionManager.open(file);
+	const one = first.appendMessage({ role: "user", content: "first writer", timestamp: Date.now() } as never);
+	const two = second.appendMessage({ role: "user", content: "second writer", timestamp: Date.now() } as never);
+	expect(
+		readOffsetIndex(file)
+			?.records.slice(-2)
+			.map((r) => r.id),
+	).toEqual([one, two]);
+	const recovered = SessionManager.open(file);
+	expect(recovered.getLeafId()).toBe(two);
+	expect(recovered.getEntries().map((entry) => entry.id)).toEqual(expect.arrayContaining([one, two]));
+});
+
+it("continues authoritative appends when a valid session cannot be indexed", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-unsupported-index-"));
+	dirs.push(cwd);
+	const file = join(cwd, "oversized-header.jsonl");
+	const header = {
+		type: "session",
+		version: 3,
+		id: "large-header",
+		cwd,
+		timestamp: new Date().toISOString(),
+		padding: "x".repeat(70_000),
+	};
+	const first = {
+		type: "message",
+		id: "first",
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		message: { role: "user", content: "first", timestamp: Date.now() },
+	};
+	writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify(first)}\n`);
+	const manager = SessionManager.open(file);
+	const before = readFileSync(file);
+	const next = manager.appendMessage({ role: "user", content: "second", timestamp: Date.now() } as never);
+	expect(readFileSync(file).subarray(0, before.length)).toEqual(before);
+	expect(SessionManager.open(file).getLeafId()).toBe(next);
+	expect(readOffsetIndex(file)).toBeNull();
+});
+
+it("reloads a fully materialized manager when another writer leaves an unindexed source entry", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-external-unindexed-"));
+	dirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	const firstId = manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() } as never);
+	const file = manager.getSessionFile()!;
+	const external = {
+		type: "message",
+		id: "external-id",
+		parentId: firstId,
+		timestamp: new Date().toISOString(),
+		message: { role: "user", content: "external", timestamp: Date.now() },
+	};
+	appendFileSync(file, `${JSON.stringify(external)}\n`);
+	const ownId = manager.appendMessage({ role: "user", content: "own", timestamp: Date.now() } as never);
+	const recovered = SessionManager.open(file);
+	expect(readOffsetIndex(file)?.records.map((r) => r.id)).toEqual(
+		expect.arrayContaining([firstId, external.id, ownId]),
+	);
+	expect(recovered.getEntries().map((e) => e.id)).toEqual(expect.arrayContaining([firstId, external.id, ownId]));
 });
 
 it("selectively resumes the same ID after an active append without parsing old or abandoned bodies", () => {

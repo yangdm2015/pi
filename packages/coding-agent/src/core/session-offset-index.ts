@@ -55,6 +55,47 @@ interface OffsetDelta {
 	checksum: string;
 }
 
+interface FileStamp {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
+/** Private to one live SessionManager; never valid across process restarts. */
+export interface OffsetIndexAppendCursor {
+	dev: number;
+	ino: number;
+	offset: number;
+	anchor: string;
+	checksum: string;
+	snapshot: FileStamp;
+	journal: FileStamp | null;
+	ids: Set<string>;
+}
+
+function sidecarStamp(path: string): FileStamp | null {
+	try {
+		const stat = lstatSync(path);
+		if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("Unsafe index sidecar");
+		return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function sameStamp(left: FileStamp | null, right: FileStamp | null): boolean {
+	return left === null || right === null
+		? left === right
+		: left.dev === right.dev &&
+				left.ino === right.ino &&
+				left.size === right.size &&
+				left.mtimeMs === right.mtimeMs &&
+				left.ctimeMs === right.ctimeMs;
+}
+
 function metadataFor(entry: SessionEntry, start: number, end: number): OffsetRecord {
 	const record: OffsetRecord = { id: entry.id, parentId: entry.parentId, type: entry.type, start, end };
 	if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary")
@@ -299,6 +340,115 @@ export function readOffsetIndex(file: string, allowAppendedSource = false): Offs
 		return index;
 	} catch {
 		return null;
+	}
+}
+
+/** Seed only from a fully validated index. The source may have changed during
+ * validation, in which case the caller must use the authoritative fallback. */
+export function createOffsetIndexAppendCursor(file: string, index: OffsetIndex): OffsetIndexAppendCursor | null {
+	try {
+		const source = lstatSync(file);
+		if (
+			!source.isFile() ||
+			source.isSymbolicLink() ||
+			source.dev !== index.dev ||
+			source.ino !== index.ino ||
+			source.size !== index.offset ||
+			typeof index.checksum !== "string" ||
+			sourceAnchor(file, index.offset) !== index.anchor
+		)
+			return null;
+		const snapshot = sidecarStamp(`${file}.idx`);
+		if (!snapshot) return null;
+		return {
+			dev: source.dev,
+			ino: source.ino,
+			offset: index.offset,
+			anchor: index.anchor,
+			checksum: index.checksum,
+			snapshot,
+			journal: sidecarStamp(`${file}.idx.delta`),
+			ids: new Set(index.records.map((record) => record.id)),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** O(new line + fixed boundary) during ordinary live appends; cold loads still
+ * validate the full snapshot and journal before creating this cursor. */
+export function appendOffsetIndexWithCursor(
+	file: string,
+	entry: SessionEntry,
+	cursor: OffsetIndexAppendCursor,
+): boolean {
+	try {
+		const source = lstatSync(file);
+		if (
+			!source.isFile() ||
+			source.isSymbolicLink() ||
+			cursor.ids.has(entry.id) ||
+			source.dev !== cursor.dev ||
+			source.ino !== cursor.ino ||
+			source.size <= cursor.offset ||
+			sourceAnchor(file, cursor.offset) !== cursor.anchor ||
+			!sameStamp(sidecarStamp(`${file}.idx`), cursor.snapshot) ||
+			!sameStamp(sidecarStamp(`${file}.idx.delta`), cursor.journal)
+		)
+			return false;
+		const length = source.size - cursor.offset;
+		const tail = readAt(file, cursor.offset, length);
+		if (tail.at(-1) !== 10 || tail.indexOf(10) !== length - 1) return false;
+		const physical = JSON.parse(tail.subarray(0, -1).toString("utf8")) as {
+			id?: string;
+			parentId?: string | null;
+			type?: string;
+		};
+		if (physical.id !== entry.id || physical.parentId !== entry.parentId || physical.type !== entry.type)
+			return false;
+		const record = metadataFor(entry, cursor.offset, source.size);
+		const anchor = sourceAnchor(file, source.size);
+		const payload = { prev: cursor.checksum, record, anchor };
+		const checksum = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+		const bytes = Buffer.from(`${JSON.stringify({ ...payload, checksum })}\n`);
+		const beforeWrite = lstatSync(file);
+		if (
+			beforeWrite.dev !== source.dev ||
+			beforeWrite.ino !== source.ino ||
+			beforeWrite.size !== source.size ||
+			beforeWrite.mtimeMs !== source.mtimeMs ||
+			!sameStamp(sidecarStamp(`${file}.idx`), cursor.snapshot) ||
+			!sameStamp(sidecarStamp(`${file}.idx.delta`), cursor.journal)
+		)
+			return false;
+		const fd = openSync(
+			`${file}.idx.delta`,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW,
+			0o600,
+		);
+		try {
+			const current = fstatSync(fd);
+			if (
+				!current.isFile() ||
+				(current.mode & 0o077) !== 0 ||
+				current.size !== (cursor.journal?.size ?? 0) ||
+				(cursor.journal !== null && (current.dev !== cursor.journal.dev || current.ino !== cursor.journal.ino))
+			)
+				return false;
+			if (writeSync(fd, bytes) !== bytes.length) return false;
+		} finally {
+			closeSync(fd);
+		}
+		const journal = sidecarStamp(`${file}.idx.delta`);
+		if (!journal || journal.size !== (cursor.journal?.size ?? 0) + bytes.length) return false;
+		cursor.offset = source.size;
+		cursor.anchor = anchor;
+		cursor.checksum = checksum;
+		cursor.journal = journal;
+		cursor.ids.add(entry.id);
+		return true;
+	} catch {
+		return false;
 	}
 }
 

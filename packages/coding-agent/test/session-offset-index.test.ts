@@ -1,4 +1,5 @@
 import {
+	appendFileSync,
 	chmodSync,
 	mkdtempSync,
 	readFileSync,
@@ -12,7 +13,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildSessionContext, type FileEntry, SessionManager } from "../src/core/session-manager.js";
-import { buildOffsetIndex, loadIndexedActiveSession, readOffsetIndex } from "../src/core/session-offset-index.js";
+import {
+	appendOffsetIndexWithCursor,
+	buildOffsetIndex,
+	createOffsetIndexAppendCursor,
+	loadIndexedActiveSession,
+	readOffsetIndex,
+} from "../src/core/session-offset-index.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -49,6 +56,64 @@ function fixture() {
 }
 
 describe("session offset metadata index", () => {
+	it("uses a verified cursor without re-parsing historical index metadata on each append", () => {
+		const { file, entries } = fixture();
+		expect(buildOffsetIndex(file, entries)).toBe(true);
+		const cursor = createOffsetIndexAppendCursor(file, readOffsetIndex(file)!);
+		expect(cursor).not.toBeNull();
+		const originalParse = JSON.parse;
+		const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, ...args: unknown[]) => {
+			if (typeof text === "string" && text.includes('"records":['))
+				throw new Error("re-parsed whole historical index");
+			return originalParse(text, ...(args as [any]));
+		});
+		try {
+			for (let i = 0; i < 3; i++) {
+				const entry = {
+					type: "message",
+					id: `new-${i}`,
+					parentId: i ? `new-${i - 1}` : "msg-2",
+					timestamp: "2026-09-27T00:00:03Z",
+					message: { role: "user", content: `new ${i}`, timestamp: 3 + i },
+				} as FileEntry;
+				appendFileSync(file, `${JSON.stringify(entry)}\n`);
+				expect(appendOffsetIndexWithCursor(file, entry as never, cursor!)).toBe(true);
+			}
+		} finally {
+			spy.mockRestore();
+		}
+		expect(
+			readOffsetIndex(file)
+				?.records.slice(-3)
+				.map((record) => record.id),
+		).toEqual(["new-0", "new-1", "new-2"]);
+	});
+
+	it("rejects an archived ID collision without writing index metadata", () => {
+		const { file, entries } = fixture();
+		expect(buildOffsetIndex(file, entries)).toBe(true);
+		const cursor = createOffsetIndexAppendCursor(file, readOffsetIndex(file)!)!;
+		const sameId = { ...entries[2], parentId: "msg-2" } as FileEntry;
+		appendFileSync(file, `${JSON.stringify(sameId)}\n`);
+		expect(appendOffsetIndexWithCursor(file, sameId as never, cursor)).toBe(false);
+		expect(cursor.ids.has("msg-2")).toBe(true);
+		expect(readOffsetIndex(file)).toBeNull();
+	});
+
+	it("rejects sidecar replacement and external source append with a cached cursor", () => {
+		const { file, entries } = fixture();
+		expect(buildOffsetIndex(file, entries)).toBe(true);
+		const cursor = createOffsetIndexAppendCursor(file, readOffsetIndex(file)!);
+		expect(cursor).not.toBeNull();
+		const replacement = `${file}.idx.bak`;
+		renameSync(`${file}.idx`, replacement);
+		writeFileSync(`${file}.idx`, readFileSync(replacement), { mode: 0o600 });
+		const next = { ...entries[2], id: "new-1", parentId: "msg-2" } as FileEntry;
+		appendFileSync(file, `${JSON.stringify(next)}\n`);
+		expect(appendOffsetIndexWithCursor(file, next as never, cursor!)).toBe(false);
+		expect(readOffsetIndex(file)).toBeNull();
+	});
+
 	it("records byte-exact ranges without storing old message bodies", () => {
 		const { file, entries } = fixture();
 		expect(buildOffsetIndex(file, entries)).toBe(true);
