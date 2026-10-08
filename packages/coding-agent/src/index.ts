@@ -262,6 +262,11 @@ export {
 	type PromptTemplate,
 } from "./core/sdk.ts";
 export {
+	createCheckpointSession,
+	createCheckpointSessionIfLarge,
+	replaceStoppedSessionWithCheckpoint,
+} from "./core/session-checkpoint.ts";
+export {
 	type BranchSummaryEntry,
 	buildContextEntries,
 	buildSessionContext,

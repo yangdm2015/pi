@@ -62,6 +62,8 @@ export function serializeWithImageRefs(entry: object, sessionFile: string): stri
 			const stat = lstatSync(target);
 			if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
 				throw new Error(`Unsafe session image: ${target}`);
+			if (createHash("sha256").update(readFileSync(target)).digest("hex") !== hash)
+				throw new Error(`Corrupt session image: ${target}`);
 		} else {
 			const temp = join(dir, `.${hash}.${randomUUID()}`);
 			const fd = openSync(temp, "wx", 0o600);

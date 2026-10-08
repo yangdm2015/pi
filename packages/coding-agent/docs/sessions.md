@@ -17,6 +17,9 @@ Use `/name` or `--name` to assign a recognizable session name. Run `/session` to
 
 The session picker lets you search, rename, and delete sessions. It can also show paths, change sorting, and limit results to named sessions. See [Keybindings](keybindings.md#sessions) for its shortcuts.
 
+The isolated same-ID hot sidecar and lazy image implementation is described in [Hot Session Store](session-hot-store.md). The separate stopped-session file-replacement experiment is described in [Bounded Session Prototype](session-checkpoint-prototype.md). Neither is deployed to the installed Pi runtime.
+
+## Session Commands
 The same-ID hot sidecar and lazy image implementation is described in [Hot Session Store](session-hot-store.md).
 
 ## Choose how to branch
