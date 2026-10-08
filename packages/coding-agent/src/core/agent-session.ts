@@ -828,7 +828,7 @@ export class AgentSession {
 				reason: failed ? "retry" : userTurn ? "user" : "continuation",
 				thinkingLevel,
 				signal,
-			);
+			});
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(

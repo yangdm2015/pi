@@ -82,7 +82,7 @@ describe("same logical Pi session with bounded hot storage", () => {
 		const opened = SessionManager.open(file);
 		const entry = opened.getActiveEntries().at(-1);
 		expect(entry?.type).toBe("message");
-		if (entry?.type !== "message" || !Array.isArray(entry.message.content)) throw new Error("Missing image");
+		if (entry?.type !== "message" || entry.message.role !== "user" || !Array.isArray(entry.message.content)) throw new Error("Missing image");
 		expect(entry.message.content[0]).toMatchObject({ data: expect.stringMatching(/^pi-blob:\/\/sha256\//) });
 		expect(opened.buildSessionContext().messages.at(-1)).toMatchObject({
 			content: [{ type: "image", data, mimeType: "image/png" }],

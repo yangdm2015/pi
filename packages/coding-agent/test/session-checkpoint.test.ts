@@ -52,7 +52,7 @@ describe("offline session checkpoint", () => {
 		const restored = SessionManager.open(result.path);
 		expect(restored.buildSessionContext()).toEqual(expected);
 		expect(restored.getSessionName()).toBe("test title");
-		expect(restored.getHeader().parentSession).toBe(original);
+		expect(restored.getHeader()?.parentSession).toBe(original);
 	});
 
 	it("externalizes retained images and refuses incomplete source lines without modifying the archive", () => {
