@@ -12,14 +12,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildSessionContext, type FileEntry, SessionManager } from "../src/core/session-manager.js";
+import { buildSessionContext, type FileEntry, SessionManager } from "../src/core/session-manager.ts";
 import {
 	appendOffsetIndexWithCursor,
 	buildOffsetIndex,
 	createOffsetIndexAppendCursor,
 	loadIndexedActiveSession,
 	readOffsetIndex,
-} from "../src/core/session-offset-index.js";
+} from "../src/core/session-offset-index.ts";
 
 const dirs: string[] = [];
 afterEach(() => {

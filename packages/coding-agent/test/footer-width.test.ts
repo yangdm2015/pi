@@ -96,8 +96,8 @@ function createSession(options: {
 				}
 				return { totals, latestCacheHitRate };
 			},
-						getEntryCount: () => entries.length,
-						getSessionId: () => "test-session",
+			getEntryCount: () => entries.length,
+			getSessionId: () => "test-session",
 			getLeafId: () => null,
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",

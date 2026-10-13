@@ -2,8 +2,8 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { SessionManager } from "../src/core/session-manager.js";
-import { buildOffsetIndex, readOffsetIndex } from "../src/core/session-offset-index.js";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { buildOffsetIndex, readOffsetIndex } from "../src/core/session-offset-index.ts";
 
 const dirs: string[] = [];
 afterEach(() => {

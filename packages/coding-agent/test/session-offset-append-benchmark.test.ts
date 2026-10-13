@@ -2,13 +2,13 @@ import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "vitest";
-import type { FileEntry } from "../src/core/session-manager.js";
+import type { FileEntry } from "../src/core/session-manager.ts";
 import {
 	appendOffsetIndexWithCursor,
 	buildOffsetIndex,
 	createOffsetIndexAppendCursor,
 	readOffsetIndex,
-} from "../src/core/session-offset-index.js";
+} from "../src/core/session-offset-index.ts";
 
 it("prints isolated metadata append timings (no production files)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-index-append-bench-"));

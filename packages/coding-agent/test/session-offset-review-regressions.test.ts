@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "../src/core/compaction/compaction.js";
-import { SessionManager } from "../src/core/session-manager.js";
-import { buildOffsetIndex } from "../src/core/session-offset-index.js";
+import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "../src/core/compaction/compaction.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { buildOffsetIndex } from "../src/core/session-offset-index.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
